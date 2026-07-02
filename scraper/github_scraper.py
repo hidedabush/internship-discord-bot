@@ -16,6 +16,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from utils.tags import add_company_classification_tag
+
 LOGGER = logging.getLogger(__name__)
 
 REQUEST_HEADERS = {
@@ -202,10 +204,12 @@ def parse_table_row(
     title_cell = row.get("title", cells[1] if len(cells) > 1 else "")
     location_cell = row.get("location", cells[2] if len(cells) > 2 else "")
     application_cell = row.get("application", cells[3] if len(cells) > 3 else "")
+    uploaded_cell = row.get("age", cells[4] if len(cells) > 4 else "")
 
     company = extract_display_text(company_cell)
     title = extract_display_text(title_cell)
     location = extract_display_text(location_cell)
+    uploaded_at = extract_display_text(uploaded_cell)
     application_url = extract_best_url(application_cell) or extract_best_url(title_cell) or extract_best_url(company_cell)
 
     # Some repos use ↳ for additional roles from the same company.
@@ -230,7 +234,8 @@ def parse_table_row(
         "source_url": source_url,
         "source_type": "github_readme",
         "date_found": datetime.now(timezone.utc).isoformat(),
-        "tags": infer_tags(combined_text),
+        "uploaded_at": uploaded_at,
+        "tags": add_company_classification_tag(infer_tags(combined_text), company),
         "status": status,
     }
     return internship, previous_company

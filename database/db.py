@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from utils.tags import add_company_classification_tag
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = ROOT_DIR / "internships.db"
 
@@ -49,6 +51,7 @@ def init_db() -> None:
                 source_url TEXT,
                 source_type TEXT,
                 tags TEXT,
+                uploaded_at TEXT,
                 first_seen TEXT NOT NULL,
                 last_seen TEXT NOT NULL,
                 posted_to_discord INTEGER DEFAULT 0,
@@ -64,7 +67,17 @@ def init_db() -> None:
             )
             """
         )
+        _ensure_column(conn, "internships", "uploaded_at", "TEXT")
         conn.commit()
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
+    columns = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
 def upsert_internship(internship: Dict[str, Any]) -> Tuple[int, bool]:
@@ -79,7 +92,10 @@ def upsert_internship(internship: Dict[str, Any]) -> Tuple[int, bool]:
     application_url = internship.get("application_url") or ""
     dedupe_key = build_dedupe_key(company, title, application_url)
     current_time = now_iso()
-    tags = ",".join(internship.get("tags", []))
+    tags_list = add_company_classification_tag(internship.get("tags", []), company)
+    internship["tags"] = tags_list
+    tags = ",".join(tags_list)
+    uploaded_at = internship.get("uploaded_at") or internship.get("date_found") or ""
 
     with _connect() as conn:
         existing = conn.execute(
@@ -94,7 +110,8 @@ def upsert_internship(internship: Dict[str, Any]) -> Tuple[int, bool]:
                 SET last_seen = ?, location = COALESCE(NULLIF(?, ''), location),
                     source_url = COALESCE(NULLIF(?, ''), source_url),
                     source_type = COALESCE(NULLIF(?, ''), source_type),
-                    tags = COALESCE(NULLIF(?, ''), tags)
+                    tags = COALESCE(NULLIF(?, ''), tags),
+                    uploaded_at = COALESCE(NULLIF(?, ''), uploaded_at)
                 WHERE dedupe_key = ?
                 """,
                 (
@@ -103,6 +120,7 @@ def upsert_internship(internship: Dict[str, Any]) -> Tuple[int, bool]:
                     internship.get("source_url", ""),
                     internship.get("source_type", ""),
                     tags,
+                    uploaded_at,
                     dedupe_key,
                 ),
             )
@@ -113,8 +131,8 @@ def upsert_internship(internship: Dict[str, Any]) -> Tuple[int, bool]:
             """
             INSERT INTO internships (
                 dedupe_key, company, title, location, application_url, source_url,
-                source_type, tags, first_seen, last_seen, posted_to_discord, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                source_type, tags, uploaded_at, first_seen, last_seen, posted_to_discord, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
             """,
             (
                 dedupe_key,
@@ -125,6 +143,7 @@ def upsert_internship(internship: Dict[str, Any]) -> Tuple[int, bool]:
                 internship.get("source_url", ""),
                 internship.get("source_type", "unknown"),
                 tags,
+                uploaded_at,
                 current_time,
                 current_time,
                 internship.get("status", "unknown"),

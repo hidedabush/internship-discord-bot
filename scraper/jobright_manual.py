@@ -9,6 +9,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Dict, List
 
+from utils.tags import add_company_classification_tag
+
 
 def build_manual_jobright_job(
     url: str,
@@ -25,6 +27,7 @@ def build_manual_jobright_job(
         "source_url": url.strip(),
         "source_type": "jobright_manual",
         "date_found": datetime.now(timezone.utc).isoformat(),
-        "tags": tags or ["manual", "jobright", "internship"],
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        "tags": add_company_classification_tag(tags or ["manual", "jobright", "internship"], company),
         "status": "unknown",
     }

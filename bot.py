@@ -33,6 +33,7 @@ config = load_config()
 intents = discord.Intents.default()
 # Slash commands do not need message_content intent. Keeping it off makes setup easier.
 bot = commands.Bot(command_prefix="!", intents=intents)
+startup_scan_completed = False
 
 
 def get_post_channel() -> discord.TextChannel | None:
@@ -74,6 +75,8 @@ async def scan_and_post() -> dict:
 
 @bot.event
 async def on_ready() -> None:
+    global startup_scan_completed
+
     init_db()
     LOGGER.info("Logged in as %s", bot.user)
 
@@ -92,24 +95,30 @@ async def on_ready() -> None:
         LOGGER.exception("Failed to sync slash commands")
 
     if config.get("auto_scan_enabled") and not scheduled_scan.is_running():
-        scheduled_scan.change_interval(minutes=int(config.get("scan_interval_minutes", 60)))
+        scheduled_scan.change_interval(minutes=int(config.get("scan_interval_minutes", 240)))
         scheduled_scan.start()
 
-    if config.get("auto_scan_on_start"):
+    if config.get("auto_scan_on_start") and not startup_scan_completed:
         LOGGER.info("auto_scan_on_start is enabled. Running first scan.")
         try:
             await scan_and_post()
+            startup_scan_completed = True
         except Exception:
             LOGGER.exception("Startup scan failed")
 
 
-@tasks.loop(minutes=60)
+@tasks.loop(minutes=240)
 async def scheduled_scan() -> None:
     try:
         LOGGER.info("Running scheduled internship scan")
         await scan_and_post()
     except Exception:
         LOGGER.exception("Scheduled scan failed")
+
+
+@scheduled_scan.before_loop
+async def before_scheduled_scan() -> None:
+    await asyncio.sleep(int(config.get("scan_interval_minutes", 240)) * 60)
 
 
 @bot.tree.command(name="scan", description="Manually scan all enabled internship sources.")
@@ -191,6 +200,8 @@ async def status_command(interaction: discord.Interaction) -> None:
         "**Internship Bot Status**\n"
         f"Bot user: `{bot.user}`\n"
         f"Posting channel: `{channel_id}`\n"
+        f"Auto scan: `{config.get('auto_scan_enabled')}` every `{config.get('scan_interval_minutes')}` minutes\n"
+        f"Scan on startup: `{config.get('auto_scan_on_start')}`\n"
         f"Sources: `{len(enabled_sources)}` enabled / `{len(sources)}` total\n"
         f"Last scan: `{current_stats['last_scan_time']}`\n"
         f"Jobs found last scan: `{current_stats['last_scan_found_count']}`\n"

@@ -1,8 +1,8 @@
 {
   "discord_channel_id": "1521221262251135238",
-  "scan_interval_minutes": 60,
-  "auto_scan_enabled": false,
-  "auto_scan_on_start": false,
+  "scan_interval_minutes": 240,
+  "auto_scan_enabled": true,
+  "auto_scan_on_start": true,
   "max_posts_per_scan": 20,
   "include_keywords": [
     "software",

@@ -10,6 +10,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Dict, List
 
+from utils.tags import add_company_classification_tag
+
 
 def build_manual_linkedin_job(
     url: str,
@@ -26,6 +28,7 @@ def build_manual_linkedin_job(
         "source_url": url.strip(),
         "source_type": "linkedin_manual",
         "date_found": datetime.now(timezone.utc).isoformat(),
-        "tags": tags or ["manual", "linkedin", "internship"],
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        "tags": add_company_classification_tag(tags or ["manual", "linkedin", "internship"], company),
         "status": "unknown",
     }

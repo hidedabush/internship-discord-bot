@@ -14,9 +14,9 @@ CONFIG_PATH = ROOT_DIR / "config.json"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "discord_channel_id": "",
-    "scan_interval_minutes": 60,
-    "auto_scan_enabled": False,
-    "auto_scan_on_start": False,
+    "scan_interval_minutes": 240,
+    "auto_scan_enabled": True,
+    "auto_scan_on_start": True,
     "max_posts_per_scan": 20,
     "include_keywords": [
         "software",
@@ -59,7 +59,11 @@ def load_config() -> Dict[str, Any]:
     if os.getenv("DISCORD_CHANNEL_ID"):
         config["discord_channel_id"] = os.getenv("DISCORD_CHANNEL_ID")
     if os.getenv("SCAN_INTERVAL_MINUTES"):
-        config["scan_interval_minutes"] = int(os.getenv("SCAN_INTERVAL_MINUTES", "60"))
+        config["scan_interval_minutes"] = int(os.getenv("SCAN_INTERVAL_MINUTES", "240"))
+    if os.getenv("AUTO_SCAN_ENABLED"):
+        config["auto_scan_enabled"] = os.getenv("AUTO_SCAN_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    if os.getenv("AUTO_SCAN_ON_START"):
+        config["auto_scan_on_start"] = os.getenv("AUTO_SCAN_ON_START", "").strip().lower() in {"1", "true", "yes", "on"}
     if os.getenv("MAX_POSTS_PER_SCAN"):
         config["max_posts_per_scan"] = int(os.getenv("MAX_POSTS_PER_SCAN", "20"))
 

@@ -26,7 +26,7 @@
       <table>
         <thead>
           <tr>
-            <th>Company</th><th>Role</th><th>Location</th><th>Tags</th><th>Status</th><th>Apply</th><th>First seen</th>
+            <th>Company</th><th>Role</th><th>Location</th><th>Tags</th><th>Status</th><th>Apply</th><th>Uploaded</th><th>First seen</th>
           </tr>
         </thead>
         <tbody>
@@ -47,6 +47,7 @@
                 </form>
               </td>
               <td><a href="{{ job.application_url }}" target="_blank">Open</a></td>
+              <td>{{ job.uploaded_at or 'Unknown' }}</td>
               <td>{{ job.first_seen }}</td>
             </tr>
           {% endfor %}

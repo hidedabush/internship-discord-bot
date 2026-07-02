@@ -1,25 +1,28 @@
 # Discord Internship Bot
 
-A beginner-friendly Discord bot that runs locally on your Windows laptop and posts internship opportunities into a private Discord channel.
+A beginner-friendly Discord bot that runs locally, scans public GitHub internship README sources, stores opportunities in SQLite, and posts new internship alerts into a Discord channel.
 
-The MVP supports public GitHub internship README repositories. LinkedIn and Jobright are supported through safe manual link ingestion instead of direct scraping.
+LinkedIn and Jobright are supported through safe manual link ingestion instead of direct scraping.
 
 ## What this bot does
 
-- Runs only when you start it locally.
-- Scans enabled GitHub README sources.
-- Parses Markdown internship tables.
+- Automatically scans enabled GitHub README sources every 4 hours while the bot is running.
+- Runs one scan on startup by default.
+- Posts only new internships that have not already been posted to Discord.
 - Stores jobs in local SQLite: `internships.db`.
 - Avoids duplicate Discord posts using company + role + application link.
-- Posts clean embeds into your private Discord channel.
+- Includes upload/source age info in Discord posts when the source provides it.
+- Adds a FAANG or Non-FAANG tag to each opportunity.
+- Adds emoji-powered tags to make Discord posts easier to scan.
 - Lets you manage GitHub sources with slash commands.
 - Includes an optional local dashboard at `http://localhost:5000`.
+- Includes a future hourly email digest template in `utils/email_digest_template.py`.
 
 ## Important LinkedIn and Jobright note
 
 This project does **not** directly scrape LinkedIn or Jobright.
 
-LinkedIn commonly blocks bots and states that crawlers/bots/extensions that scrape or automate LinkedIn are not permitted. Job boards also often change layouts, require login, block automated traffic, or restrict automated extraction in their terms. Because of that, this bot uses safer alternatives:
+LinkedIn commonly blocks bots and many job boards restrict automated extraction. Because of that, this bot uses safer alternatives:
 
 - Paste a job URL manually with `/add_manual_job`.
 - Use saved job links you personally found.
@@ -30,32 +33,34 @@ LinkedIn commonly blocks bots and states that crawlers/bots/extensions that scra
 
 ```text
 discord-internship-bot/
-├── bot.py
-├── scanner.py
-├── scraper/
-│   ├── __init__.py
-│   ├── github_scraper.py
-│   ├── linkedin_manual.py
-│   └── jobright_manual.py
-├── database/
-│   ├── __init__.py
-│   └── db.py
-├── dashboard/
-│   ├── app.py
-│   └── templates/
-│       ├── index.html
-│       └── internships.html
-├── utils/
-│   ├── config_loader.py
-│   ├── source_store.py
-│   ├── formatting.py
-│   └── filters.py
-├── config.json
-├── sources.json
-├── requirements.txt
-├── README.md
-├── .env.example
-└── .gitignore
+|-- bot.py
+|-- scanner.py
+|-- scraper/
+|   |-- __init__.py
+|   |-- github_scraper.py
+|   |-- linkedin_manual.py
+|   `-- jobright_manual.py
+|-- database/
+|   |-- __init__.py
+|   `-- db.py
+|-- dashboard/
+|   |-- app.py
+|   `-- templates/
+|       |-- index.html
+|       `-- internships.html
+|-- utils/
+|   |-- config_loader.py
+|   |-- email_digest_template.py
+|   |-- filters.py
+|   |-- formatting.py
+|   |-- source_store.py
+|   `-- tags.py
+|-- config.json
+|-- sources.json
+|-- requirements.txt
+|-- README.md
+|-- .env.example
+`-- .gitignore
 ```
 
 ## Setup guide for Windows
@@ -143,7 +148,7 @@ Do not share this token. Do not commit `.env` to GitHub.
 
 ### 3. Enable intents
 
-This MVP uses slash commands and does not need Message Content Intent.
+This bot uses slash commands and does not need Message Content Intent.
 
 You can leave privileged intents off unless you later add text-prefix commands or member-reading features.
 
@@ -220,15 +225,36 @@ In your private Discord channel, run:
 
 This saves the current channel ID into `config.json`.
 
-### Scan internships
+### Automatic scans
 
-Run:
+By default, `config.json` is set to:
+
+```json
+{
+  "scan_interval_minutes": 240,
+  "auto_scan_enabled": true,
+  "auto_scan_on_start": true
+}
+```
+
+That means:
+
+- The bot runs one scan when it starts.
+- The bot scans again every 4 hours.
+- Only new jobs are posted to Discord.
+- Jobs already posted stay in SQLite and are not posted again.
+
+The bot still only runs while your laptop is on and `python bot.py` is running.
+
+### Manual scan
+
+You can still run a scan any time:
 
 ```text
 /scan
 ```
 
-The bot will scan enabled GitHub sources, store jobs in SQLite, and post new jobs into the configured channel.
+The bot scans enabled GitHub sources, stores jobs in SQLite, and posts new jobs into the configured channel.
 
 ### Stop the bot
 
@@ -238,16 +264,41 @@ In PowerShell, press:
 Ctrl + C
 ```
 
+## Discord post format
+
+Each new internship embed includes:
+
+- Company
+- Role
+- Location
+- Uploaded time or source age, when available
+- Apply link
+- Source link
+- Emoji tags
+- FAANG or Non-FAANG classification
+
+Example tags:
+
+```text
+💻 Software, 🎓 Internship, ⭐ FAANG
+```
+
+```text
+📊 Data, 🌱 Non-FAANG
+```
+
+FAANG detection currently covers common aliases for Meta/Facebook, Apple, Amazon/AWS, Netflix, and Google/Alphabet.
+
 ## Discord commands
 
-- `/scan` — manually scan all enabled GitHub sources.
-- `/add_source <url>` — add a new GitHub internship repository or README URL.
-- `/list_sources` — show all saved sources.
-- `/remove_source <url_or_id>` — remove a source by ID or exact URL.
-- `/set_channel` — set the current channel as the posting channel.
-- `/status` — show bot status, number of sources, last scan time, and job counts.
-- `/add_manual_job <source> <url> [company] [title] [location]` — manually save a LinkedIn or Jobright link.
-- `/help` — show available commands.
+- `/scan` - manually scan all enabled GitHub sources.
+- `/add_source <url>` - add a new GitHub internship repository or README URL.
+- `/list_sources` - show all saved sources.
+- `/remove_source <url_or_id>` - remove a source by ID or exact URL.
+- `/set_channel` - set the current channel as the posting channel.
+- `/status` - show bot status, schedule, last scan time, and job counts.
+- `/add_manual_job <source> <url> [company] [title] [location]` - manually save a LinkedIn or Jobright link.
+- `/help` - show available commands.
 
 ## Add more GitHub internship links
 
@@ -278,25 +329,23 @@ Edit `config.json`:
 ```json
 {
   "discord_channel_id": "",
-  "scan_interval_minutes": 60,
-  "auto_scan_enabled": false,
-  "auto_scan_on_start": false,
+  "scan_interval_minutes": 240,
+  "auto_scan_enabled": true,
+  "auto_scan_on_start": true,
   "max_posts_per_scan": 20,
   "include_keywords": ["software", "swe", "intern", "data", "ai", "quant", "gpu", "cuda"],
   "exclude_keywords": ["senior", "staff", "principal", "full-time", "new grad"]
 }
 ```
 
-Recommended beginner setting: keep `auto_scan_enabled` as `false` and use `/scan` manually until everything works.
+Optional `.env` overrides:
 
-If you want scheduled scanning while the bot is running locally, set:
-
-```json
-"auto_scan_enabled": true,
-"scan_interval_minutes": 60
+```env
+SCAN_INTERVAL_MINUTES=240
+AUTO_SCAN_ENABLED=true
+AUTO_SCAN_ON_START=true
+MAX_POSTS_PER_SCAN=20
 ```
-
-The bot still only runs while your laptop is on and `python bot.py` is running.
 
 ## Optional dashboard
 
@@ -322,7 +371,32 @@ Dashboard features:
 - Add a GitHub source URL.
 - Enable/disable sources.
 - View found internships.
+- See uploaded/source age and first-seen time.
 - Mark internships as `saved`, `applied`, `ignored`, `closed`, etc.
+
+## Future hourly email digest
+
+The project includes a template for the next upgrade in:
+
+```text
+utils/email_digest_template.py
+```
+
+`render_hourly_email_digest(jobs)` returns:
+
+- `subject`
+- `text`
+- `html`
+
+It is ready to be used later by an hourly job that:
+
+1. Reads new internships from SQLite.
+2. Reads subscribed user email addresses from a user database table.
+3. Renders the digest template.
+4. Sends the email through a provider such as SendGrid, Mailgun, Amazon SES, or SMTP.
+5. Marks those jobs as emailed so users do not receive duplicates.
+
+No email is sent yet. This file is only the digest template for the later database-email feature.
 
 ## How duplicate detection works
 
@@ -359,6 +433,13 @@ That key is stored in SQLite as a unique value. If the same job appears again in
 - Make sure the bot has permission to view and send messages in that channel.
 - Make sure the bot has **Embed Links** permission.
 
+### Scheduled scans are not running
+
+- Check `/status` and confirm auto scan is enabled.
+- Confirm `scan_interval_minutes` is `240`.
+- Keep `python bot.py` running. The schedule stops when the process stops.
+- If you changed `.env` or `config.json`, restart the bot.
+
 ### Slash commands do not appear
 
 - Set `DISCORD_GUILD_ID` in `.env` for faster local testing.
@@ -376,7 +457,7 @@ That key is stored in SQLite as a unique value. If the same job appears again in
 ### Duplicate jobs keep posting
 
 - Confirm that `internships.db` is not being deleted between runs.
-- Check if the application links are changing every scan due tracking parameters.
+- Check if the application links are changing every scan due to tracking parameters.
 - Improve `build_dedupe_key()` in `database/db.py` if needed.
 
 ### Python package install errors
@@ -390,36 +471,17 @@ python -m pip install -r requirements.txt
 
 If Python is not found, reinstall Python and check **Add python.exe to PATH**.
 
-### Permission errors in Discord
-
-- Check channel permissions, not just server permissions.
-- Private channels need explicit bot access.
-- Make sure role order does not block the bot.
-- Re-invite the bot if you forgot a permission during invite.
-
-## Future upgrade ideas
-
-- Deploy later to Railway, Render, or a VPS.
-- Add email alerts.
-- Add AI summarization of job posts.
-- Add automatic resume keyword matching.
-- Add a stronger applied tracker with notes and deadlines.
-- Add CSV export.
-- Add CSV import for manual LinkedIn/Jobright saved jobs.
-- Add GitHub Actions later if you ever want scheduled cloud scanning.
-- Add per-source category filters.
-- Add a web dashboard login if you deploy it outside localhost.
-
 ## Development notes
 
-This project is intentionally not overengineered. The main flow is:
+The main flow is:
 
-1. `bot.py` receives `/scan`.
+1. `bot.py` starts the Discord bot and scheduled scan loop.
 2. `scanner.py` loads enabled sources from `sources.json`.
 3. `scraper/github_scraper.py` fetches and parses GitHub READMEs.
 4. `utils/filters.py` applies include/exclude keywords.
-5. `database/db.py` stores and deduplicates jobs.
-6. `utils/formatting.py` formats jobs as Discord embeds.
-7. `bot.py` posts new jobs and marks them as posted.
+5. `utils/tags.py` adds FAANG or Non-FAANG classification.
+6. `database/db.py` stores and deduplicates jobs.
+7. `utils/formatting.py` formats jobs as Discord embeds.
+8. `bot.py` posts new jobs and marks them as posted.
 
-If you want to add a new source later, create a new module in `scraper/`, return the same internship dictionary shape, and call it from `scanner.py`.
+If you add a new source later, create a new module in `scraper/`, return the same internship dictionary shape, and call it from `scanner.py`.
