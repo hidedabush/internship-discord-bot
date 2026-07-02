@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Found Internships</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 1200px; margin: 40px auto; padding: 0 20px; background: #f7f7fb; color: #1f2937; }
+    .card { background: white; border-radius: 14px; padding: 20px; margin-bottom: 20px; box-shadow: 0 6px 20px rgba(0,0,0,.06); }
+    button, .button { padding: 8px 12px; border: 0; border-radius: 8px; background: #111827; color: white; cursor: pointer; text-decoration: none; display: inline-block; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 10px; border-bottom: 1px solid #e5e7eb; text-align: left; vertical-align: top; }
+    select { padding: 7px; border-radius: 8px; border: 1px solid #d1d5db; }
+    .muted { color: #6b7280; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Found Internships</h1>
+    <a class="button" href="{{ url_for('index') }}">Back to sources</a>
+    <p class="muted">Use the Discord bot <code>/scan</code> command to find new jobs, then refresh this page.</p>
+  </div>
+
+  <div class="card">
+    {% if jobs %}
+      <table>
+        <thead>
+          <tr>
+            <th>Company</th><th>Role</th><th>Location</th><th>Tags</th><th>Status</th><th>Apply</th><th>First seen</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for job in jobs %}
+            <tr>
+              <td>{{ job.company }}</td>
+              <td>{{ job.title }}</td>
+              <td>{{ job.location }}</td>
+              <td>{{ ', '.join(job.tags) }}</td>
+              <td>
+                <form method="post" action="{{ url_for('update_status_route') }}">
+                  <input type="hidden" name="internship_id" value="{{ job.id }}">
+                  <select name="status" onchange="this.form.submit()">
+                    {% for option in ['unknown', 'active', 'saved', 'applied', 'ignored', 'closed'] %}
+                      <option value="{{ option }}" {% if job.status == option %}selected{% endif %}>{{ option }}</option>
+                    {% endfor %}
+                  </select>
+                </form>
+              </td>
+              <td><a href="{{ job.application_url }}" target="_blank">Open</a></td>
+              <td>{{ job.first_seen }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p>No internships in the database yet. Run <code>/scan</code> in Discord first.</p>
+    {% endif %}
+  </div>
+</body>
+</html>

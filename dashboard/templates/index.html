@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Internship Bot Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 1000px; margin: 40px auto; padding: 0 20px; background: #f7f7fb; color: #1f2937; }
+    .card { background: white; border-radius: 14px; padding: 20px; margin-bottom: 20px; box-shadow: 0 6px 20px rgba(0,0,0,.06); }
+    input[type="url"] { width: 70%; padding: 10px; border: 1px solid #d1d5db; border-radius: 8px; }
+    button, .button { padding: 10px 14px; border: 0; border-radius: 8px; background: #111827; color: white; cursor: pointer; text-decoration: none; display: inline-block; }
+    .danger { background: #b91c1c; }
+    .muted { color: #6b7280; font-size: 14px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 12px; border-bottom: 1px solid #e5e7eb; text-align: left; vertical-align: top; }
+    code { background: #eef2ff; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Discord Internship Bot Dashboard</h1>
+    <p class="muted">Local-only dashboard. Do not expose this to the public internet.</p>
+    <a class="button" href="{{ url_for('internships') }}">View internships</a>
+  </div>
+
+  <div class="card">
+    <h2>Add GitHub source</h2>
+    <form method="post" action="{{ url_for('add_source_route') }}">
+      <input type="url" name="url" placeholder="https://github.com/SimplifyJobs/Summer2026-Internships" required>
+      <button type="submit">Add source</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Saved sources</h2>
+    {% if sources %}
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Status</th><th>Type</th><th>URL</th><th>Actions</th></tr>
+        </thead>
+        <tbody>
+          {% for source in sources %}
+            <tr>
+              <td><code>{{ source.id }}</code></td>
+              <td>{{ 'enabled' if source.enabled else 'disabled' }}</td>
+              <td>{{ source.type }}</td>
+              <td><a href="{{ source.url }}" target="_blank">{{ source.url }}</a></td>
+              <td>
+                <form method="post" action="{{ url_for('toggle_source_route') }}" style="display:inline">
+                  <input type="hidden" name="source_id" value="{{ source.id }}">
+                  <input type="hidden" name="enabled" value="{{ 'false' if source.enabled else 'true' }}">
+                  <button type="submit">{{ 'Disable' if source.enabled else 'Enable' }}</button>
+                </form>
+                <form method="post" action="{{ url_for('remove_source_route') }}" style="display:inline">
+                  <input type="hidden" name="source_id" value="{{ source.id }}">
+                  <button class="danger" type="submit">Remove</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p>No sources yet.</p>
+    {% endif %}
+  </div>
+</body>
+</html>
