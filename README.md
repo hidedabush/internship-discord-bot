@@ -129,6 +129,151 @@ DISCORD_TOKEN=your_real_token_here
 
 Do not share this token. Do not commit `.env` to GitHub.
 
+## Docker setup guide
+
+Use Docker if you want the bot to keep running in a container instead of directly in your Windows PowerShell session.
+
+### 1. Install Docker Desktop
+
+1. Install Docker Desktop for Windows.
+2. Start Docker Desktop.
+3. Open PowerShell in this project folder.
+4. Confirm Docker works:
+
+```powershell
+docker --version
+```
+
+### 2. Create your `.env` file
+
+If you have not already created it, copy the example file:
+
+```powershell
+copy .env.example .env
+```
+
+Edit `.env` and set at least:
+
+```env
+DISCORD_TOKEN=your_real_token_here
+```
+
+Optional but recommended while testing:
+
+```env
+DISCORD_GUILD_ID=your_server_id_here
+```
+
+You can also set the posting channel in `.env` if you already know it:
+
+```env
+DISCORD_CHANNEL_ID=your_channel_id_here
+```
+
+Otherwise, run `/set_channel` in Discord after the bot starts.
+
+### 3. Check the `Dockerfile`
+
+The project includes this `Dockerfile`:
+
+```dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["python", "bot.py"]
+```
+
+### 4. Check `.dockerignore`
+
+The project includes this `.dockerignore`:
+
+```text
+.env
+.git
+.venv
+venv
+__pycache__
+*.pyc
+internships.db
+```
+
+This keeps secrets, your local virtual environment, and your local database out of the Docker image.
+
+### 5. Build the Docker image
+
+```powershell
+docker build -t discord-internship-bot .
+```
+
+### 6. Run the bot container
+
+This command starts the bot and mounts the project folder into the container so `config.json`, `sources.json`, and `internships.db` persist on your computer:
+
+```powershell
+docker run --name discord-internship-bot --env-file .env -v ${PWD}:/app discord-internship-bot
+```
+
+If the bot starts correctly, you should see logs saying it logged into Discord and synced slash commands.
+
+### 7. Stop and restart the container
+
+Stop it:
+
+```powershell
+docker stop discord-internship-bot
+```
+
+Start it again:
+
+```powershell
+docker start -a discord-internship-bot
+```
+
+If you changed code or dependencies, rebuild and recreate the container:
+
+```powershell
+docker stop discord-internship-bot
+docker rm discord-internship-bot
+docker build -t discord-internship-bot .
+docker run --name discord-internship-bot --env-file .env -v ${PWD}:/app discord-internship-bot
+```
+
+### Optional: run the dashboard in Docker
+
+The dashboard currently binds to `127.0.0.1` inside Python. To access it from your browser through Docker, change the last line of `dashboard/app.py` from:
+
+```python
+app.run(host="127.0.0.1", port=5000, debug=True)
+```
+
+to:
+
+```python
+app.run(host="0.0.0.0", port=5000, debug=True)
+```
+
+Then rebuild the image and run the dashboard command:
+
+```powershell
+docker build -t discord-internship-bot .
+docker run --name internship-dashboard --env-file .env -p 5000:5000 -v ${PWD}:/app discord-internship-bot python dashboard/app.py
+```
+
+Open:
+
+```text
+http://localhost:5000
+```
+
+The dashboard is not password protected, so only expose it on your own machine or private network.
+
 ## Discord bot creation guide
 
 ### 1. Create a Discord application

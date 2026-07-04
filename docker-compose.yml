@@ -1,0 +1,36 @@
+services:
+  internship-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: internship-bot
+    restart: unless-stopped
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN}
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
+      DISCORD_CHANNEL_ID: ${DISCORD_CHANNEL_ID:-}
+      SCAN_INTERVAL_MINUTES: ${SCAN_INTERVAL_MINUTES:-240}
+      AUTO_SCAN_ENABLED: ${AUTO_SCAN_ENABLED:-true}
+      AUTO_SCAN_ON_START: ${AUTO_SCAN_ON_START:-true}
+      MAX_POSTS_PER_SCAN: ${MAX_POSTS_PER_SCAN:-20}
+      PYTHONUNBUFFERED: 1
+    volumes:
+      # Bind mount for development hot reload
+      - ./bot.py:/app/bot.py:ro
+      - ./scanner.py:/app/scanner.py:ro
+      - ./config.json:/app/config.json
+      - ./database:/app/database:ro
+      - ./scraper:/app/scraper:ro
+      - ./utils:/app/utils:ro
+      # Persist database and config across restarts
+      - internship_data:/app
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  internship_data:
