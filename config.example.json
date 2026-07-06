@@ -1,5 +1,5 @@
 {
-  "discord_channel_id": "1521221262251135238",
+  "discord_channel_id": "",
   "scan_interval_minutes": 240,
   "auto_scan_enabled": true,
   "auto_scan_on_start": true,
@@ -27,5 +27,17 @@
     "principal",
     "full-time",
     "new grad"
-  ]
+  ],
+  "llm_filter_enabled": false,
+  "ollama_host": "http://192.168.1.84:11434",
+  "ollama_model": "llama3.2:3b",
+  "llm_timeout_seconds": 15,
+  "llm_min_quality_score": 1,
+  "premium_role_id": "",
+  "personal_digest_top_n": 5,
+  "personal_digest_min_score": 4,
+  "uptime_kuma_push_url": "",
+  "heartbeat_interval_minutes": 5,
+  "data_retention_days": 180,
+  "storage_maintenance_interval_hours": 24
 }

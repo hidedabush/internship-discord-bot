@@ -68,6 +68,13 @@ def format_uploaded_at(internship: Dict) -> str:
     return f"<t:{timestamp}:R> (<t:{timestamp}:f>)"
 
 
+def format_quality_score(quality_score: object) -> str:
+    if not isinstance(quality_score, int):
+        return ""
+    quality_score = max(1, min(5, quality_score))
+    return f"{'⭐' * quality_score}{'☆' * (5 - quality_score)} ({quality_score}/5)"
+
+
 def source_display_name(source_url: str, source_type: str) -> str:
     if "SimplifyJobs" in source_url:
         return "GitHub - SimplifyJobs"
@@ -104,6 +111,14 @@ def internship_to_embed(internship: Dict) -> discord.Embed:
     embed.add_field(name="Uploaded", value=format_uploaded_at(internship), inline=True)
     embed.add_field(name="Role", value=title, inline=False)
 
+    # Only present when llm_filter_enabled scored this posting.
+    quality_display = format_quality_score(internship.get("quality_score"))
+    if quality_display:
+        embed.add_field(name="Match", value=quality_display, inline=True)
+        llm_reason = str(internship.get("llm_reason") or "").strip()
+        if llm_reason:
+            embed.set_footer(text=llm_reason)
+
     if application_url.startswith("http"):
         embed.add_field(name="Apply", value=f"[Open application]({application_url})", inline=False)
     else:
@@ -119,6 +134,20 @@ def internship_to_embed(internship: Dict) -> discord.Embed:
         embed.add_field(name="Source", value=source_display_name(source_url, source_type), inline=False)
 
     embed.add_field(name="Tags", value=format_tags(internship.get("tags", [])), inline=False)
+    return embed
+
+
+def personal_match_to_embed(internship: Dict, match_score: int, reason: str) -> discord.Embed:
+    """Personalized variant of internship_to_embed for premium DM digests.
+
+    Reuses internship_to_embed for the shared fields, then foregrounds *why
+    this matches you specifically* — distinct from the server-wide "Match"
+    quality field (if llm_filter_enabled also scored this posting).
+    """
+    embed = internship_to_embed(internship)
+    embed.color = discord.Color.purple()
+    embed.description = f"**Why this matches you:** {reason}" if reason else "Personalized match."
+    embed.add_field(name="Your Match", value=format_quality_score(match_score), inline=True)
     return embed
 
 

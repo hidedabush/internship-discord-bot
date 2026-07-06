@@ -129,6 +129,19 @@ DISCORD_TOKEN=your_real_token_here
 
 Do not share this token. Do not commit `.env` to GitHub.
 
+### 6. Create your `config.json` and `sources.json`
+
+These hold your live channel ID and saved sources, and are gitignored so your personal
+settings never get committed. Copy the templates:
+
+```powershell
+copy config.example.json config.json
+copy sources.example.json sources.json
+```
+
+You do not need to edit them by hand — `/set_channel` and `/add_source` (or the
+dashboard) fill these in for you.
+
 ## Docker setup guide
 
 Use Docker if you want the bot to keep running in a container instead of directly in your Windows PowerShell session.
@@ -172,47 +185,37 @@ DISCORD_CHANNEL_ID=your_channel_id_here
 
 Otherwise, run `/set_channel` in Discord after the bot starts.
 
-### 3. Check the `Dockerfile`
+### 3. Create your `config.json` and `sources.json`
 
-The project includes this `Dockerfile`:
+```powershell
+copy config.example.json config.json
+copy sources.example.json sources.json
+```
+
+Both are gitignored and mounted into the container so they persist across rebuilds.
+
+### 5. Check the `Dockerfile`
+
+The project includes a multi-stage `Dockerfile` (dependencies build in one stage, the
+runtime image only copies the installed virtual environment and the app code, keeping
+the final image smaller) that ends with:
 
 ```dockerfile
-FROM python:3.12-slim
-
-WORKDIR /app
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
 CMD ["python", "bot.py"]
 ```
 
-### 4. Check `.dockerignore`
+### 6. Check `.dockerignore`
 
-The project includes this `.dockerignore`:
+The project includes a `.dockerignore` that keeps secrets, your local virtual
+environment, caches, and your local database out of the Docker build context.
 
-```text
-.env
-.git
-.venv
-venv
-__pycache__
-*.pyc
-internships.db
-```
-
-This keeps secrets, your local virtual environment, and your local database out of the Docker image.
-
-### 5. Build the Docker image
+### 7. Build the Docker image
 
 ```powershell
 docker build -t discord-internship-bot .
 ```
 
-### 6. Run the bot container
+### 8. Run the bot container
 
 This command starts the bot and mounts the project folder into the container so `config.json`, `sources.json`, and `internships.db` persist on your computer:
 
@@ -222,7 +225,7 @@ docker run --name discord-internship-bot --env-file .env -v ${PWD}:/app discord-
 
 If the bot starts correctly, you should see logs saying it logged into Discord and synced slash commands.
 
-### 7. Stop and restart the container
+### 9. Stop and restart the container
 
 Stop it:
 
@@ -247,23 +250,13 @@ docker run --name discord-internship-bot --env-file .env -v ${PWD}:/app discord-
 
 ### Optional: run the dashboard in Docker
 
-The dashboard currently binds to `127.0.0.1` inside Python. To access it from your browser through Docker, change the last line of `dashboard/app.py` from:
-
-```python
-app.run(host="127.0.0.1", port=5000, debug=True)
-```
-
-to:
-
-```python
-app.run(host="0.0.0.0", port=5000, debug=True)
-```
-
-Then rebuild the image and run the dashboard command:
+The dashboard binds to `127.0.0.1` and runs with Flask debug mode off by default, and
+it refuses to start on a non-loopback host unless `DASHBOARD_USERNAME` and
+`DASHBOARD_PASSWORD` are both set. To access it from your browser through Docker, set
+those plus `DASHBOARD_HOST=0.0.0.0` when running the container:
 
 ```powershell
-docker build -t discord-internship-bot .
-docker run --name internship-dashboard --env-file .env -p 5000:5000 -v ${PWD}:/app discord-internship-bot python dashboard/app.py
+docker run --name internship-dashboard --env-file .env -e DASHBOARD_HOST=0.0.0.0 -e DASHBOARD_USERNAME=youruser -e DASHBOARD_PASSWORD=yourpassword -p 5000:5000 -v ${PWD}:/app discord-internship-bot python dashboard/app.py
 ```
 
 Open:
@@ -272,7 +265,12 @@ Open:
 http://localhost:5000
 ```
 
-The dashboard is not password protected, so only expose it on your own machine or private network.
+You'll be prompted for the username/password (HTTP Basic Auth) once `DASHBOARD_HOST`
+is widened. Only do this on a network you trust — never expose it to the public
+internet. Never set `DASHBOARD_DEBUG=true` unless you're debugging locally with
+`DASHBOARD_HOST` left at `127.0.0.1`: Flask's debug mode exposes an unauthenticated
+interactive Python console over HTTP whenever a route raises, which is a remote
+code execution risk the moment the dashboard is reachable from anywhere else.
 
 ## Discord bot creation guide
 
@@ -293,9 +291,13 @@ The dashboard is not password protected, so only expose it on your own machine o
 
 ### 3. Enable intents
 
-This bot uses slash commands and does not need Message Content Intent.
+This bot uses slash commands and does not need Message Content Intent — leave that off.
 
-You can leave privileged intents off unless you later add text-prefix commands or member-reading features.
+It **does** require the **Server Members Intent** (a privileged intent), because the
+premium-tier personalized DM digest needs to resolve which members hold the premium
+role. Turn this on in the **Bot** tab, under **Privileged Gateway Intents**, even if
+you're not using the premium tier yet — the bot requests it unconditionally, and
+Discord will refuse the connection with `PrivilegedIntentsRequired` if it's off.
 
 ### 4. Create the invite URL
 
@@ -443,6 +445,9 @@ FAANG detection currently covers common aliases for Meta/Facebook, Apple, Amazon
 - `/set_channel` - set the current channel as the posting channel.
 - `/status` - show bot status, schedule, last scan time, and job counts.
 - `/add_manual_job <source> <url> [company] [title] [location]` - manually save a LinkedIn or Jobright link.
+- `/set_premium_role <role>` - admin only: set which role gets personalized DM digests.
+- `/set_profile <blurb>` - premium members: set your interests for personalized matching.
+- `/my_profile` - show your saved profile and premium status.
 - `/help` - show available commands.
 
 ## Add more GitHub internship links
@@ -491,6 +496,151 @@ AUTO_SCAN_ENABLED=true
 AUTO_SCAN_ON_START=true
 MAX_POSTS_PER_SCAN=20
 ```
+
+## Optional local-LLM relevance and quality scoring
+
+The keyword include/exclude filter above is cheap but coarse: it can't tell a strong
+posting from a weak one, and it lets through the occasional parser mistake as long as
+a keyword happens to match. If you have a local Ollama server, the bot can run a
+second pass that judges each new posting for relevance and gives it a 1-5 quality
+score, so when a scan finds more postings than `max_posts_per_scan` can send at once,
+the strongest matches win the scarce slots instead of whichever happened to appear
+first in a README.
+
+Enable it in `config.json`:
+
+```json
+{
+  "llm_filter_enabled": true,
+  "ollama_host": "http://192.168.1.84:11434",
+  "ollama_model": "llama3.2:3b",
+  "llm_timeout_seconds": 15,
+  "llm_min_quality_score": 1
+}
+```
+
+Or via `.env`: `LLM_FILTER_ENABLED=true`, `OLLAMA_HOST=...`, `OLLAMA_MODEL=...`.
+
+Make sure the model is pulled first:
+
+```bash
+docker exec ollama ollama pull llama3.2:3b
+```
+
+Notes:
+
+- **Off by default.** Nothing changes until `llm_filter_enabled` is `true`.
+- **Fails open.** If Ollama is unreachable, slow, or returns something unusable, the
+  posting is kept with a neutral score rather than dropped — a flaky LLM call should
+  never cause a real internship to go unposted.
+- **Only runs on new postings**, after the keyword filter, so it's not spending a
+  model call on every row of every README on every scan.
+- **`llm_min_quality_score`** (1-5) additionally drops postings scored below the
+  threshold, on top of the model's own relevant/not-relevant judgement. Leave at `1`
+  to only filter, not additionally threshold.
+- Scored postings show a star rating ("Match") and the model's one-line reason (as
+  the embed footer) in Discord; unscored postings (feature off, or the fallback path)
+  show neither.
+
+## Optional premium tier: personalized DM digests
+
+Everything above ranks/filters postings the same way for the whole server. The
+premium tier adds a second, *personalized* layer on top for members your organization
+has marked as paid/premium — it doesn't change or gate anything the rest of the
+server sees.
+
+There's no billing integration here at all. "Premium" is just a Discord role your
+officers assign the same way you'd assign any other role (e.g. when dues are paid) —
+the bot only checks whether a member holds that role.
+
+**Setup:**
+
+1. Create a role in your server for premium members (any name).
+2. Make sure **Server Members Intent** is enabled (see the intents step above) —
+   required for the bot to know who holds the role.
+3. Run `/set_premium_role @YourPremiumRole` (admin/Manage Server permission required).
+4. Premium members run `/set_profile` with 1-3 sentences describing what they're
+   looking for, e.g. `"Backend/Go internships, remote OK, sophomore, open to startups"`.
+   `/my_profile` shows what's currently saved.
+
+That's it — after every scan, each premium member with a saved profile gets DMed
+their top matches from that scan (ranked and explained against *their* blurb, not
+just the server-wide ranking), in addition to the shared channel post everyone gets.
+
+Config (`config.json`):
+
+```json
+{
+  "premium_role_id": "",
+  "personal_digest_top_n": 5,
+  "personal_digest_min_score": 4
+}
+```
+
+- **`personal_digest_top_n`** — max postings DMed per member per scan.
+- **`personal_digest_min_score`** (1-5) — only DM postings scored at or above this
+  personal-fit score; keeps digests from including a "meh" match just to fill five
+  slots.
+- Uses the same `ollama_host`/`ollama_model`/`llm_timeout_seconds` settings as the
+  server-wide LLM filter above, and the same fail-open behavior — if Ollama is
+  unreachable, that member's digest is silently skipped for this scan rather than
+  DMing them something broken or blocking the shared-channel post.
+- If a premium member has DMs closed to the bot, they're skipped (logged, not
+  retried) — it doesn't affect anyone else's digest or the shared channel post.
+
+## Uptime monitoring (Uptime Kuma)
+
+The bot has no HTTP server, so it can't be health-checked the usual way (something
+pinging a `/health` endpoint). Instead it pushes a heartbeat *out* to an Uptime Kuma
+[Push monitor](https://github.com/louislam/uptime-kuma) on a timer — if the process
+dies, hangs, or loses its connection, the pings stop arriving and Kuma flags it down
+using whatever alerting you've already got configured there.
+
+**Setup, in Uptime Kuma:**
+
+1. Add New Monitor → Monitor Type: **Push**.
+2. Set the **Heartbeat Interval** to something a bit longer than
+   `heartbeat_interval_minutes` below (e.g. 2x it), so a single missed tick doesn't
+   immediately page you.
+3. Save, then copy the Push URL it gives you
+   (`http://<kuma-host>:3001/api/push/<token>?status=up&msg=OK&ping=`).
+
+**Setup, in this bot** (`.env`, since the URL contains an auth token):
+
+```env
+UPTIME_KUMA_PUSH_URL=http://192.168.1.84:3001/api/push/your-token-here
+```
+
+Optional (`config.json`): `heartbeat_interval_minutes` (default `5`).
+
+Notes:
+
+- **Off by default** — nothing pings anywhere until `UPTIME_KUMA_PUSH_URL` is set.
+- This is a liveness check only (bot process alive and connected to Discord), not a
+  "is everything working perfectly" check — Ollama being down, for instance, doesn't
+  stop the heartbeat, since the LLM features already fail open gracefully instead of
+  crashing. If you want that level of detail, `/status` shows it directly.
+- A failed push (Kuma unreachable) is logged and dropped, not retried — the next
+  scheduled tick tries again on its own.
+
+## Storage maintenance
+
+Nothing in the bot ever prunes on its own by default in most bots — this one does,
+so `internships.db` doesn't grow forever on a server that's meant to run for months.
+A daily background task (`storage_maintenance_interval_hours`, default `24`):
+
+1. Deletes postings older than `data_retention_days` (default `180`) whose status is
+   still `closed`, `unknown`, or `ignored`. Postings marked `active`, `applied`, or
+   `saved` (via the dashboard) are **never** auto-deleted, regardless of age — those
+   carry personal value that outweighs the storage cost.
+2. Runs `PRAGMA wal_checkpoint(TRUNCATE)` and `VACUUM` to flush the WAL file and
+   reclaim disk space the deletes freed up.
+
+This always runs (no config flag to enable it — it has no external dependency and is
+cheap even when there's nothing to prune). Set `data_retention_days` to `0` or
+negative to disable the pruning step specifically while still keeping the
+checkpoint/VACUUM housekeeping. Check current database size and retention settings
+any time with `/status`.
 
 ## Optional dashboard
 
@@ -628,5 +778,25 @@ The main flow is:
 6. `database/db.py` stores and deduplicates jobs.
 7. `utils/formatting.py` formats jobs as Discord embeds.
 8. `bot.py` posts new jobs and marks them as posted.
+9. `bot.py` also DMs each premium member (see the premium tier section above) their
+   personal top matches for this scan's new jobs, scored by `utils/personalization.py`
+   against their `/set_profile` blurb.
 
 If you add a new source later, create a new module in `scraper/`, return the same internship dictionary shape, and call it from `scanner.py`.
+
+`FULL_PROJECT.md` is a generated snapshot of every tracked file for onboarding/AI-assistant
+context — don't hand-edit it. Regenerate it after changing any tracked file:
+
+```bash
+python scripts/generate_full_project_doc.py
+```
+
+### Running tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Tests focus on `scraper/github_scraper.py` (the markdown-table parser is the most
+format-fragile part of the project) and `utils/tags.py` (FAANG alias matching).

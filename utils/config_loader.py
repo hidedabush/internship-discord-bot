@@ -42,6 +42,27 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "full-time",
         "new grad",
     ],
+    # Optional second-pass filtering/ranking using a local Ollama model. Off by
+    # default since it requires a running Ollama server with a model pulled.
+    "llm_filter_enabled": False,
+    "ollama_host": "http://192.168.1.84:11434",
+    "ollama_model": "llama3.2:3b",
+    "llm_timeout_seconds": 15,
+    "llm_min_quality_score": 1,
+    # Premium tier: members with this role get a personalized DM digest after
+    # each scan (see /set_premium_role, /set_profile). Empty = feature off.
+    "premium_role_id": "",
+    "personal_digest_top_n": 5,
+    "personal_digest_min_score": 4,
+    # Uptime Kuma Push-monitor heartbeat. Empty = feature off (no HTTP surface
+    # otherwise, so this is a periodic outbound ping, not an inbound check).
+    "uptime_kuma_push_url": "",
+    "heartbeat_interval_minutes": 5,
+    # Storage maintenance always runs (no external dependency); this just
+    # controls how far back it prunes. <= 0 disables pruning but still
+    # checkpoints/vacuums the database on the same schedule.
+    "data_retention_days": 180,
+    "storage_maintenance_interval_hours": 24,
 }
 
 
@@ -66,6 +87,19 @@ def load_config() -> Dict[str, Any]:
         config["auto_scan_on_start"] = os.getenv("AUTO_SCAN_ON_START", "").strip().lower() in {"1", "true", "yes", "on"}
     if os.getenv("MAX_POSTS_PER_SCAN"):
         config["max_posts_per_scan"] = int(os.getenv("MAX_POSTS_PER_SCAN", "20"))
+    if os.getenv("LLM_FILTER_ENABLED"):
+        config["llm_filter_enabled"] = os.getenv("LLM_FILTER_ENABLED", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    if os.getenv("OLLAMA_HOST"):
+        config["ollama_host"] = os.getenv("OLLAMA_HOST")
+    if os.getenv("OLLAMA_MODEL"):
+        config["ollama_model"] = os.getenv("OLLAMA_MODEL")
+    if os.getenv("UPTIME_KUMA_PUSH_URL"):
+        config["uptime_kuma_push_url"] = os.getenv("UPTIME_KUMA_PUSH_URL")
 
     config["discord_token"] = os.getenv("DISCORD_TOKEN", "")
     config["discord_guild_id"] = os.getenv("DISCORD_GUILD_ID", "")

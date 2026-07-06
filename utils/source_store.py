@@ -79,5 +79,22 @@ def set_source_enabled(source_id: str, enabled: bool) -> Optional[Dict[str, Any]
     return None
 
 
+def update_source_fetch_cache(source_id: str, resolved_raw_url: str, etag: str) -> None:
+    """Remember the raw URL and ETag that resolved successfully for a source.
+
+    Lets the next scan skip straight to the right branch instead of guessing
+    HEAD/main/master/dev again, and skip re-downloading unchanged READMEs.
+    """
+    if not source_id:
+        return
+    sources = load_sources()
+    for source in sources:
+        if source.get("id") == source_id:
+            source["resolved_raw_url"] = resolved_raw_url
+            source["etag"] = etag
+            save_sources(sources)
+            return
+
+
 def get_enabled_sources() -> List[Dict[str, Any]]:
     return [s for s in load_sources() if s.get("enabled", True)]

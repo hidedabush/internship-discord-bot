@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from utils.tags import add_company_classification_tag
 
@@ -15,8 +16,13 @@ DB_PATH = ROOT_DIR / "internships.db"
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    # WAL lets the dashboard read while the bot writes (and vice versa) without
+    # "database is locked" errors; busy_timeout makes writers retry instead of
+    # failing immediately when they do briefly collide.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -28,11 +34,50 @@ def normalize_value(value: str) -> str:
     return " ".join((value or "").strip().lower().split())
 
 
+_TRACKING_PARAM_PREFIXES = ("utm_",)
+_TRACKING_PARAM_NAMES = {
+    "fbclid",
+    "gclid",
+    "msclkid",
+    "mc_cid",
+    "mc_eid",
+    "ref",
+    "ref_src",
+    "source",
+    "igshid",
+}
+
+
+def strip_tracking_params(url: str) -> str:
+    """Drop known tracking params (utm_*, fbclid, ...) and any fragment.
+
+    Many ATS platforms (Greenhouse, Lever, Workday) encode the actual job id
+    in a query param, so we only remove params known to be pure tracking
+    noise rather than stripping the whole query string — otherwise two
+    different real postings could collide into the same dedupe key.
+    """
+    if not url:
+        return url
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+
+    kept_params = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key.lower() not in _TRACKING_PARAM_NAMES
+        and not key.lower().startswith(_TRACKING_PARAM_PREFIXES)
+    ]
+    new_query = urlencode(kept_params)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, ""))
+
+
 def build_dedupe_key(company: str, title: str, application_url: str) -> str:
     raw = "|".join([
         normalize_value(company),
         normalize_value(title),
-        normalize_value(application_url),
+        normalize_value(strip_tracking_params(application_url)),
     ])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -67,7 +112,18 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS member_profiles (
+                user_id TEXT PRIMARY KEY,
+                blurb TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         _ensure_column(conn, "internships", "uploaded_at", "TEXT")
+        _ensure_column(conn, "internships", "quality_score", "INTEGER")
+        _ensure_column(conn, "internships", "llm_reason", "TEXT")
         conn.commit()
 
 
@@ -197,6 +253,17 @@ def get_unposted(limit: int = 20) -> List[Dict[str, Any]]:
     return [_row_to_dict(row) for row in rows]
 
 
+def update_internship_relevance(internship_id: int, quality_score: int, reason: str) -> None:
+    """Persist the local-LLM relevance judgement so the dashboard and future
+    scans (via get_unposted) can see and sort on it."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE internships SET quality_score = ?, llm_reason = ? WHERE id = ?",
+            (quality_score, reason, internship_id),
+        )
+        conn.commit()
+
+
 def update_internship_status(internship_id: int, status: str) -> None:
     allowed = {"active", "closed", "unknown", "applied", "ignored", "saved"}
     if status not in allowed:
@@ -236,6 +303,92 @@ def stats() -> Dict[str, Any]:
         "last_scan_time": get_state("last_scan_time", "Never"),
         "last_scan_found_count": get_state("last_scan_found_count", "0"),
     }
+
+
+def set_member_profile(user_id: str, blurb: str) -> None:
+    """Save (or replace) a premium member's short interest blurb."""
+    init_db()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO member_profiles(user_id, blurb, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET blurb = excluded.blurb, updated_at = excluded.updated_at
+            """,
+            (str(user_id), blurb, now_iso()),
+        )
+        conn.commit()
+
+
+def get_member_profile(user_id: str) -> Optional[str]:
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT blurb FROM member_profiles WHERE user_id = ?", (str(user_id),)
+        ).fetchone()
+    return row["blurb"] if row else None
+
+
+def list_member_profiles() -> Dict[str, str]:
+    """Return {user_id: blurb} for every member who has set a profile."""
+    init_db()
+    with _connect() as conn:
+        rows = conn.execute("SELECT user_id, blurb FROM member_profiles").fetchall()
+    return {row["user_id"]: row["blurb"] for row in rows}
+
+
+_PRESERVED_STATUSES = {"active", "applied", "saved"}
+
+
+def prune_old_internships(retention_days: int) -> int:
+    """Delete stale closed/unknown/ignored postings older than retention_days.
+
+    Postings a member has flagged active/applied/saved are kept regardless of
+    age — those carry personal value the rest don't. Returns rows deleted.
+    retention_days <= 0 disables pruning entirely (returns 0).
+    """
+    if retention_days <= 0:
+        return 0
+
+    init_db()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+    placeholders = ",".join("?" for _ in _PRESERVED_STATUSES)
+    with _connect() as conn:
+        cursor = conn.execute(
+            f"""
+            DELETE FROM internships
+            WHERE last_seen < ?
+              AND status NOT IN ({placeholders})
+            """,
+            (cutoff, *_PRESERVED_STATUSES),
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
+def checkpoint_and_vacuum() -> None:
+    """Flush the WAL file and reclaim disk space freed by deletes.
+
+    Cheap on a small database, so it's safe to call on every maintenance tick
+    regardless of whether pruning actually deleted anything this time.
+    """
+    conn = _connect()
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.isolation_level = None  # VACUUM can't run inside a transaction.
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
+
+
+def run_storage_maintenance(retention_days: int) -> Dict[str, int]:
+    """Prune stale rows, then checkpoint/VACUUM. Meant to run on a schedule."""
+    deleted = prune_old_internships(retention_days)
+    checkpoint_and_vacuum()
+    return {"deleted": deleted}
+
+
+def get_db_file_size_bytes() -> int:
+    return DB_PATH.stat().st_size if DB_PATH.exists() else 0
 
 
 def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
