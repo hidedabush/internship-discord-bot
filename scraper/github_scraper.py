@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -19,6 +20,14 @@ import requests
 from utils.tags import add_company_classification_tag
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class ScrapeResult:
+    internships: List[Dict]
+    raw_url: str
+    etag: str
+    not_modified: bool
 
 REQUEST_HEADERS = {
     "User-Agent": "local-discord-internship-bot/1.0 (+https://github.com/)"
@@ -38,28 +47,55 @@ TAG_KEYWORDS = {
 }
 
 
-def scrape_github_readme(source_url: str) -> List[Dict]:
-    """Fetch a GitHub README and return normalized internship dictionaries."""
-    markdown, raw_url = fetch_readme(source_url)
+def scrape_github_readme(
+    source_url: str, preferred_url: str = "", etag: str = ""
+) -> ScrapeResult:
+    """Fetch a GitHub README and return normalized internship dictionaries.
+
+    ``preferred_url`` is the raw URL that resolved successfully last time (if
+    any), so repeat scans can skip straight to the right branch instead of
+    guessing HEAD/main/master/dev again. ``etag`` lets the server tell us
+    nothing changed (HTTP 304) so we can skip re-parsing entirely.
+    """
+    markdown, raw_url, new_etag, not_modified = fetch_readme(
+        source_url, preferred_url=preferred_url, etag=etag
+    )
+    if not_modified:
+        LOGGER.info("README unchanged since last scan for %s", source_url)
+        return ScrapeResult(internships=[], raw_url=raw_url, etag=new_etag, not_modified=True)
+
     internships = parse_markdown_tables(markdown, source_url=source_url, raw_url=raw_url)
     LOGGER.info("Scraped %s internships from %s", len(internships), source_url)
-    return internships
+    return ScrapeResult(internships=internships, raw_url=raw_url, etag=new_etag, not_modified=False)
 
 
-def fetch_readme(source_url: str) -> Tuple[str, str]:
+def fetch_readme(
+    source_url: str, preferred_url: str = "", etag: str = ""
+) -> Tuple[str, str, str, bool]:
     """Fetch README markdown from GitHub.
 
-    For normal GitHub URLs, we try HEAD first, then common branch names.
-    This avoids requiring a GitHub token or GitHub API setup.
+    Tries ``preferred_url`` first when given (the URL that worked last scan),
+    then falls back through the usual branch-name candidates. Returns
+    ``(markdown, raw_url, etag, not_modified)``; ``markdown`` is empty and
+    ``not_modified`` is True when the server confirms nothing changed.
     """
     candidate_urls = build_raw_candidates(source_url)
+    if preferred_url:
+        candidate_urls = [preferred_url] + [url for url in candidate_urls if url != preferred_url]
+
     last_error: Optional[Exception] = None
 
     for raw_url in candidate_urls:
+        headers = dict(REQUEST_HEADERS)
+        if etag and raw_url == preferred_url:
+            headers["If-None-Match"] = etag
+
         try:
-            response = requests.get(raw_url, headers=REQUEST_HEADERS, timeout=20)
+            response = requests.get(raw_url, headers=headers, timeout=20)
+            if response.status_code == 304:
+                return "", raw_url, etag, True
             if response.status_code == 200 and response.text.strip():
-                return response.text, raw_url
+                return response.text, raw_url, response.headers.get("ETag", ""), False
             LOGGER.warning("README fetch failed %s: HTTP %s", raw_url, response.status_code)
         except requests.RequestException as exc:
             last_error = exc
