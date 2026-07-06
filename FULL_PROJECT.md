@@ -1,10 +1,17 @@
 # Full Project Files
 
-This document lists every project file, what it does, and the full code/content.
+This document lists every tracked project file, what it does, and its full
+content. It is generated — do not hand-edit it, changes will be overwritten.
+
+Regenerate with:
+
+```bash
+python scripts/generate_full_project_doc.py
+```
 
 ## `bot.py`
 
-**What it does:** Main Discord bot entry point. Defines slash commands, syncs commands, runs scans, and posts new internships as Discord embeds.
+**What it does:** Discord internship bot entry point.
 
 ```python
 """Discord internship bot entry point.
@@ -17,18 +24,32 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import List
+from typing import Dict, List
 
 import discord
+import requests
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from database.db import init_db, mark_posted, stats, upsert_internship
+from database.db import (
+    get_db_file_size_bytes,
+    get_member_profile,
+    get_unposted,
+    init_db,
+    list_member_profiles,
+    mark_posted,
+    run_storage_maintenance,
+    set_member_profile,
+    stats,
+    upsert_internship,
+)
 from scanner import run_scan
 from scraper.jobright_manual import build_manual_jobright_job
 from scraper.linkedin_manual import build_manual_linkedin_job
 from utils.config_loader import load_config, save_config
-from utils.formatting import chunk_list, internship_to_embed
+from utils.formatting import chunk_list, internship_to_embed, personal_match_to_embed
+from utils.personalization import score_personal_match
+from utils.relevance import NEUTRAL_QUALITY_SCORE
 from utils.source_store import add_source, load_sources, remove_source
 
 logging.basicConfig(
@@ -41,7 +62,12 @@ config = load_config()
 
 intents = discord.Intents.default()
 # Slash commands do not need message_content intent. Keeping it off makes setup easier.
+# Members intent IS required (and privileged — enable "Server Members Intent" in the
+# Discord Developer Portal's Bot tab) for the premium tier: it's how the bot resolves
+# which members hold the premium role so it knows who to send personalized DMs to.
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+startup_scan_completed = False
 
 
 def get_post_channel() -> discord.TextChannel | None:
@@ -50,6 +76,28 @@ def get_post_channel() -> discord.TextChannel | None:
         return None
     channel = bot.get_channel(int(channel_id))
     return channel if isinstance(channel, discord.TextChannel) else None
+
+
+def is_premium_member(member: discord.Member) -> bool:
+    """Premium status is just: does this member hold the configured role.
+
+    Officers assign/remove the role manually (e.g. when dues are paid), so
+    there's no billing logic here at all — just a role check.
+    """
+    role_id = str(config.get("premium_role_id", "")).strip()
+    if not role_id:
+        return False
+    return any(str(role.id) == role_id for role in getattr(member, "roles", []))
+
+
+def get_premium_guild() -> discord.Guild | None:
+    """The single guild this bot serves (premium DMs are single-server for now)."""
+    guild_id = str(config.get("discord_guild_id", "")).strip()
+    if guild_id:
+        return bot.get_guild(int(guild_id))
+    if len(bot.guilds) == 1:
+        return bot.guilds[0]
+    return None
 
 
 async def post_jobs_to_discord(jobs: List[dict]) -> int:
@@ -61,28 +109,152 @@ async def post_jobs_to_discord(jobs: List[dict]) -> int:
 
     max_posts = int(config.get("max_posts_per_scan", 20))
     jobs_to_post = jobs[:max_posts]
-    posted_ids: List[int] = []
+    posted_count = 0
 
     # Discord allows up to 10 embeds per message. Use 5 for cleaner reading.
     for batch in chunk_list(jobs_to_post, 5):
         embeds = [internship_to_embed(job) for job in batch]
-        await channel.send(embeds=embeds)
-        posted_ids.extend([job["id"] for job in batch if "id" in job])
+        try:
+            await channel.send(embeds=embeds)
+        except discord.HTTPException:
+            LOGGER.exception("Failed to post a batch of %s job(s); will retry next scan", len(batch))
+            continue
+
+        # Mark this batch posted immediately so a later batch's failure can't
+        # cause an already-sent batch to be re-sent on the next scan.
+        mark_posted([job["id"] for job in batch if "id" in job])
+        posted_count += len(batch)
         await asyncio.sleep(1)
 
-    mark_posted(posted_ids)
-    return len(jobs_to_post)
+    return posted_count
+
+
+def _merge_unique_jobs(*job_lists: List[dict]) -> List[dict]:
+    """Combine job lists, keeping the first occurrence of each database id."""
+    merged: List[dict] = []
+    seen_ids = set()
+    for jobs in job_lists:
+        for job in jobs:
+            job_id = job.get("id")
+            if job_id is not None:
+                if job_id in seen_ids:
+                    continue
+                seen_ids.add(job_id)
+            merged.append(job)
+    return merged
+
+
+def _quality_score(job: dict) -> int:
+    score = job.get("quality_score")
+    return score if isinstance(score, int) else NEUTRAL_QUALITY_SCORE
+
+
+def build_personal_digests(
+    new_jobs: List[dict], profiles_by_user_id: Dict[str, str], config: dict
+) -> Dict[str, List[dict]]:
+    """Score this scan's new jobs against each premium member's profile blurb
+    and keep their top matches. Does many blocking Ollama calls, so callers
+    should run this via asyncio.to_thread instead of awaiting it directly.
+    """
+    if not new_jobs or not profiles_by_user_id:
+        return {}
+
+    top_n = int(config.get("personal_digest_top_n", 5))
+    min_score = int(config.get("personal_digest_min_score", 4))
+    digests: Dict[str, List[dict]] = {}
+
+    for user_id, blurb in profiles_by_user_id.items():
+        matches = []
+        for job in new_jobs:
+            verdict = score_personal_match(job, blurb, config)
+            if verdict.match_score >= min_score:
+                matches.append({**job, "match_score": verdict.match_score, "match_reason": verdict.reason})
+        matches.sort(key=lambda job: job["match_score"], reverse=True)
+        if matches:
+            digests[user_id] = matches[:top_n]
+
+    return digests
+
+
+async def send_personal_digests(digests: Dict[str, List[dict]], guild: discord.Guild) -> None:
+    for user_id, matches in digests.items():
+        member = guild.get_member(int(user_id))
+        if member is None:
+            LOGGER.warning("Premium member %s not found in guild cache; skipping their digest", user_id)
+            continue
+
+        embeds = [
+            personal_match_to_embed(job, job["match_score"], job["match_reason"]) for job in matches
+        ]
+        for index, batch in enumerate(chunk_list(embeds, 5)):
+            content = "Your personalized internship matches from this scan:" if index == 0 else None
+            try:
+                await member.send(content=content, embeds=batch)
+            except discord.Forbidden:
+                LOGGER.warning("Could not DM premium member %s (DMs closed); skipping", user_id)
+                break
+            except discord.HTTPException:
+                LOGGER.exception("Failed to send a personal digest batch to %s", user_id)
+                continue
+
+
+async def send_premium_digests(new_jobs: List[dict]) -> None:
+    """Premium members (see /set_premium_role) with a saved /set_profile blurb
+    get a personalized DM highlighting their best matches from this scan, on
+    top of (not instead of) the shared channel feed everyone else gets."""
+    if not config.get("premium_role_id"):
+        return
+
+    guild = get_premium_guild()
+    if guild is None:
+        return
+
+    profiles = list_member_profiles()
+    if not profiles:
+        return
+
+    premium_user_ids = {str(member.id) for member in guild.members if is_premium_member(member)}
+    relevant_profiles = {uid: blurb for uid, blurb in profiles.items() if uid in premium_user_ids}
+    if not relevant_profiles:
+        return
+
+    digests = await asyncio.to_thread(build_personal_digests, new_jobs, relevant_profiles, config)
+    if digests:
+        await send_personal_digests(digests, guild)
 
 
 async def scan_and_post() -> dict:
-    result = run_scan(config)
-    posted_count = await post_jobs_to_discord(result["new_jobs"])
+    # Scanning does blocking network I/O; run it off the event loop so the bot
+    # keeps responding to Discord (heartbeats, other commands) while it scans.
+    result = await asyncio.to_thread(run_scan, config)
+
+    # Jobs found in an earlier scan but never posted (because that scan hit
+    # max_posts_per_scan) are queued here so they get caught up instead of lost.
+    max_posts = int(config.get("max_posts_per_scan", 20))
+    backlog = get_unposted(limit=max_posts * 5)
+    jobs_to_post = _merge_unique_jobs(backlog, result["new_jobs"])
+
+    # Best matches first, so when there are more postings than max_posts_per_scan
+    # can send in one go, the strongest ones win the scarce slots instead of
+    # whichever happened to appear earliest in a README. Sort is stable, so
+    # postings with equal (or no) score keep their original FIFO order.
+    jobs_to_post.sort(key=_quality_score, reverse=True)
+
+    posted_count = await post_jobs_to_discord(jobs_to_post)
     result["posted_count"] = posted_count
+
+    try:
+        await send_premium_digests(result["new_jobs"])
+    except Exception:
+        LOGGER.exception("Premium digest step failed; shared-channel posting is unaffected")
+
     return result
 
 
 @bot.event
 async def on_ready() -> None:
+    global startup_scan_completed
+
     init_db()
     LOGGER.info("Logged in as %s", bot.user)
 
@@ -101,24 +273,72 @@ async def on_ready() -> None:
         LOGGER.exception("Failed to sync slash commands")
 
     if config.get("auto_scan_enabled") and not scheduled_scan.is_running():
-        scheduled_scan.change_interval(minutes=int(config.get("scan_interval_minutes", 60)))
+        scheduled_scan.change_interval(minutes=int(config.get("scan_interval_minutes", 240)))
         scheduled_scan.start()
 
-    if config.get("auto_scan_on_start"):
+    if config.get("uptime_kuma_push_url") and not heartbeat.is_running():
+        heartbeat.change_interval(minutes=int(config.get("heartbeat_interval_minutes", 5)))
+        heartbeat.start()
+
+    if not storage_maintenance.is_running():
+        storage_maintenance.change_interval(
+            hours=int(config.get("storage_maintenance_interval_hours", 24))
+        )
+        storage_maintenance.start()
+
+    if config.get("auto_scan_on_start") and not startup_scan_completed:
         LOGGER.info("auto_scan_on_start is enabled. Running first scan.")
         try:
             await scan_and_post()
+            startup_scan_completed = True
         except Exception:
             LOGGER.exception("Startup scan failed")
 
 
-@tasks.loop(minutes=60)
+@tasks.loop(minutes=240)
 async def scheduled_scan() -> None:
     try:
         LOGGER.info("Running scheduled internship scan")
         await scan_and_post()
     except Exception:
         LOGGER.exception("Scheduled scan failed")
+
+
+@scheduled_scan.before_loop
+async def before_scheduled_scan() -> None:
+    await asyncio.sleep(int(config.get("scan_interval_minutes", 240)) * 60)
+
+
+@tasks.loop(minutes=5)
+async def heartbeat() -> None:
+    """Ping an Uptime Kuma Push monitor so it can alert if this process dies
+    or hangs. Bot has no HTTP surface, so push (we ping it) instead of pull
+    (it pings us) is the natural fit. No-ops if unconfigured.
+    """
+    push_url = str(config.get("uptime_kuma_push_url", "")).strip()
+    if not push_url:
+        return
+    try:
+        await asyncio.to_thread(requests.get, push_url, timeout=10)
+    except requests.RequestException:
+        # Don't retry harder or crash — Kuma itself being briefly unreachable
+        # isn't this bot's problem, and the next tick will try again shortly.
+        LOGGER.warning("Uptime Kuma heartbeat request failed (network issue)")
+
+
+@tasks.loop(hours=24)
+async def storage_maintenance() -> None:
+    """Prune stale rows and reclaim disk space on a schedule. Always runs
+    (not config-gated) since it has no external dependency and is cheap even
+    when there's nothing to prune; data_retention_days<=0 skips pruning
+    specifically while still checkpointing/vacuuming.
+    """
+    retention_days = int(config.get("data_retention_days", 180))
+    try:
+        result = await asyncio.to_thread(run_storage_maintenance, retention_days)
+        LOGGER.info("Storage maintenance done: pruned %s old row(s)", result["deleted"])
+    except Exception:
+        LOGGER.exception("Storage maintenance failed")
 
 
 @bot.tree.command(name="scan", description="Manually scan all enabled internship sources.")
@@ -190,22 +410,94 @@ async def set_channel_command(interaction: discord.Interaction) -> None:
     )
 
 
+@bot.tree.command(
+    name="set_premium_role",
+    description="Set which role counts as a premium member (admin only).",
+)
+@app_commands.describe(role="The role that marks someone as a paid/premium member")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def set_premium_role_command(interaction: discord.Interaction, role: discord.Role) -> None:
+    config["premium_role_id"] = str(role.id)
+    save_config(config)
+    await interaction.response.send_message(
+        f"Set {role.mention} as the premium member role. Members with this role get a "
+        "personalized DM digest once they run /set_profile.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="set_profile",
+    description="Premium members: set your internship interests for a personalized DM digest.",
+)
+@app_commands.describe(
+    blurb="1-3 sentences: skills, interests, location, level (e.g. 'Backend/Go, remote OK, sophomore')"
+)
+@app_commands.guild_only()
+async def set_profile_command(interaction: discord.Interaction, blurb: str) -> None:
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not is_premium_member(member):
+        await interaction.response.send_message(
+            "Personalized matching is a premium-member feature. Ask an officer about "
+            "premium membership.",
+            ephemeral=True,
+        )
+        return
+
+    blurb = blurb.strip()
+    if not blurb:
+        await interaction.response.send_message("Profile can't be empty.", ephemeral=True)
+        return
+
+    set_member_profile(str(member.id), blurb)
+    await interaction.response.send_message(
+        "Saved. You'll get a personalized DM after each scan highlighting your best matches.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="my_profile", description="Show your saved internship interest profile.")
+@app_commands.guild_only()
+async def my_profile_command(interaction: discord.Interaction) -> None:
+    member = interaction.user
+    premium = isinstance(member, discord.Member) and is_premium_member(member)
+    blurb = get_member_profile(str(interaction.user.id))
+
+    lines = [f"Premium member: `{premium}`"]
+    if blurb:
+        lines.append(f"Saved profile: {blurb}")
+    elif premium:
+        lines.append("No profile saved yet. Use `/set_profile` to add one.")
+    else:
+        lines.append("Personalized matching is a premium-member feature.")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
 @bot.tree.command(name="status", description="Show bot status and scan stats.")
 async def status_command(interaction: discord.Interaction) -> None:
     current_stats = stats()
     sources = load_sources()
     enabled_sources = [source for source in sources if source.get("enabled", True)]
     channel_id = config.get("discord_channel_id") or "Not set"
+    db_size_mb = get_db_file_size_bytes() / (1024 * 1024)
     await interaction.response.send_message(
         "**Internship Bot Status**\n"
         f"Bot user: `{bot.user}`\n"
         f"Posting channel: `{channel_id}`\n"
+        f"Auto scan: `{config.get('auto_scan_enabled')}` every `{config.get('scan_interval_minutes')}` minutes\n"
+        f"Scan on startup: `{config.get('auto_scan_on_start')}`\n"
+        f"LLM relevance filter: `{config.get('llm_filter_enabled', False)}`\n"
+        f"Premium role: `{'configured' if config.get('premium_role_id') else 'not set'}`\n"
+        f"Uptime Kuma heartbeat: `{'enabled' if heartbeat.is_running() else 'disabled'}`\n"
         f"Sources: `{len(enabled_sources)}` enabled / `{len(sources)}` total\n"
         f"Last scan: `{current_stats['last_scan_time']}`\n"
         f"Jobs found last scan: `{current_stats['last_scan_found_count']}`\n"
         f"Total jobs in DB: `{current_stats['total']}`\n"
         f"Unposted jobs: `{current_stats['unposted']}`\n"
-        f"Applied jobs: `{current_stats['applied']}`",
+        f"Applied jobs: `{current_stats['applied']}`\n"
+        f"Database size: `{db_size_mb:.2f} MB`\n"
+        f"Data retention: `{config.get('data_retention_days', 180)}` days",
         ephemeral=True,
     )
 
@@ -259,6 +551,9 @@ async def help_command(interaction: discord.Interaction) -> None:
         "`/set_channel` — set this channel as the posting channel\n"
         "`/status` — show bot status and database stats\n"
         "`/add_manual_job <source> <url> [company] [title] [location]` — save LinkedIn/Jobright links manually\n"
+        "`/set_premium_role <role>` — admin: set which role gets personalized DM digests\n"
+        "`/set_profile <blurb>` — premium members: set your interests for personalized matching\n"
+        "`/my_profile` — show your saved profile and premium status\n"
         "`/help` — show this message",
         ephemeral=True,
     )
@@ -273,12 +568,11 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 ```
 
 ## `scanner.py`
 
-**What it does:** Coordinates enabled sources, filtering, database upserts, and scan summary stats.
+**What it does:** Run all enabled internship sources and store new jobs in SQLite.
 
 ```python
 """Run all enabled internship sources and store new jobs in SQLite."""
@@ -289,10 +583,11 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
-from database.db import init_db, set_state, upsert_internship
+from database.db import init_db, set_state, update_internship_relevance, upsert_internship
 from scraper.github_scraper import scrape_github_readme
 from utils.filters import passes_filters
-from utils.source_store import get_enabled_sources
+from utils.relevance import classify_relevance
+from utils.source_store import get_enabled_sources, update_source_fetch_cache
 
 LOGGER = logging.getLogger(__name__)
 
@@ -303,6 +598,8 @@ def run_scan(config: Dict[str, Any]) -> Dict[str, Any]:
     sources = get_enabled_sources()
     include_keywords = config.get("include_keywords", [])
     exclude_keywords = config.get("exclude_keywords", [])
+    llm_filter_enabled = bool(config.get("llm_filter_enabled", False))
+    llm_min_quality_score = int(config.get("llm_min_quality_score", 1))
 
     total_found = 0
     total_after_filters = 0
@@ -314,7 +611,13 @@ def run_scan(config: Dict[str, Any]) -> Dict[str, Any]:
         source_type = source.get("type", "github_readme")
         try:
             if source_type == "github_readme":
-                internships = scrape_github_readme(source_url)
+                result = scrape_github_readme(
+                    source_url,
+                    preferred_url=source.get("resolved_raw_url", ""),
+                    etag=source.get("etag", ""),
+                )
+                update_source_fetch_cache(source.get("id", ""), result.raw_url, result.etag)
+                internships = result.internships
             else:
                 LOGGER.info("Skipping unsupported automated source type: %s", source_type)
                 continue
@@ -327,8 +630,23 @@ def run_scan(config: Dict[str, Any]) -> Dict[str, Any]:
                 total_after_filters += 1
                 db_id, is_new = upsert_internship(internship)
                 internship["id"] = db_id
-                if is_new:
-                    new_jobs.append(internship)
+
+                # Still store closed roles (keeps dedupe/dashboard accurate), but
+                # don't post something to Discord that's already unavailable.
+                if not is_new or internship.get("status") == "closed":
+                    continue
+
+                if llm_filter_enabled:
+                    # Only spend an LLM call on postings that are actually new —
+                    # the whole point is to rank/trim what we're about to post.
+                    verdict = classify_relevance(internship, config)
+                    internship["quality_score"] = verdict.quality_score
+                    internship["llm_reason"] = verdict.reason
+                    update_internship_relevance(db_id, verdict.quality_score, verdict.reason)
+                    if not verdict.relevant or verdict.quality_score < llm_min_quality_score:
+                        continue
+
+                new_jobs.append(internship)
 
         except Exception as exc:  # Keep scanning even if one repo breaks.
             message = f"{source_url}: {exc}"
@@ -347,12 +665,11 @@ def run_scan(config: Dict[str, Any]) -> Dict[str, Any]:
         "errors": errors,
         "scan_time": scan_time,
     }
-
 ```
 
 ## `scraper/__init__.py`
 
-**What it does:** Marks scraper as a Python package.
+**What it does:** See file contents below.
 
 ```python
 
@@ -360,7 +677,7 @@ def run_scan(config: Dict[str, Any]) -> Dict[str, Any]:
 
 ## `scraper/github_scraper.py`
 
-**What it does:** Fetches public GitHub README markdown and parses internship Markdown tables into normalized job dictionaries.
+**What it does:** GitHub README internship scraper.
 
 ```python
 """GitHub README internship scraper.
@@ -375,13 +692,24 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
 
+from utils.tags import add_company_classification_tag
+
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class ScrapeResult:
+    internships: List[Dict]
+    raw_url: str
+    etag: str
+    not_modified: bool
 
 REQUEST_HEADERS = {
     "User-Agent": "local-discord-internship-bot/1.0 (+https://github.com/)"
@@ -401,28 +729,55 @@ TAG_KEYWORDS = {
 }
 
 
-def scrape_github_readme(source_url: str) -> List[Dict]:
-    """Fetch a GitHub README and return normalized internship dictionaries."""
-    markdown, raw_url = fetch_readme(source_url)
+def scrape_github_readme(
+    source_url: str, preferred_url: str = "", etag: str = ""
+) -> ScrapeResult:
+    """Fetch a GitHub README and return normalized internship dictionaries.
+
+    ``preferred_url`` is the raw URL that resolved successfully last time (if
+    any), so repeat scans can skip straight to the right branch instead of
+    guessing HEAD/main/master/dev again. ``etag`` lets the server tell us
+    nothing changed (HTTP 304) so we can skip re-parsing entirely.
+    """
+    markdown, raw_url, new_etag, not_modified = fetch_readme(
+        source_url, preferred_url=preferred_url, etag=etag
+    )
+    if not_modified:
+        LOGGER.info("README unchanged since last scan for %s", source_url)
+        return ScrapeResult(internships=[], raw_url=raw_url, etag=new_etag, not_modified=True)
+
     internships = parse_markdown_tables(markdown, source_url=source_url, raw_url=raw_url)
     LOGGER.info("Scraped %s internships from %s", len(internships), source_url)
-    return internships
+    return ScrapeResult(internships=internships, raw_url=raw_url, etag=new_etag, not_modified=False)
 
 
-def fetch_readme(source_url: str) -> Tuple[str, str]:
+def fetch_readme(
+    source_url: str, preferred_url: str = "", etag: str = ""
+) -> Tuple[str, str, str, bool]:
     """Fetch README markdown from GitHub.
 
-    For normal GitHub URLs, we try HEAD first, then common branch names.
-    This avoids requiring a GitHub token or GitHub API setup.
+    Tries ``preferred_url`` first when given (the URL that worked last scan),
+    then falls back through the usual branch-name candidates. Returns
+    ``(markdown, raw_url, etag, not_modified)``; ``markdown`` is empty and
+    ``not_modified`` is True when the server confirms nothing changed.
     """
     candidate_urls = build_raw_candidates(source_url)
+    if preferred_url:
+        candidate_urls = [preferred_url] + [url for url in candidate_urls if url != preferred_url]
+
     last_error: Optional[Exception] = None
 
     for raw_url in candidate_urls:
+        headers = dict(REQUEST_HEADERS)
+        if etag and raw_url == preferred_url:
+            headers["If-None-Match"] = etag
+
         try:
-            response = requests.get(raw_url, headers=REQUEST_HEADERS, timeout=20)
+            response = requests.get(raw_url, headers=headers, timeout=20)
+            if response.status_code == 304:
+                return "", raw_url, etag, True
             if response.status_code == 200 and response.text.strip():
-                return response.text, raw_url
+                return response.text, raw_url, response.headers.get("ETag", ""), False
             LOGGER.warning("README fetch failed %s: HTTP %s", raw_url, response.status_code)
         except requests.RequestException as exc:
             last_error = exc
@@ -567,10 +922,12 @@ def parse_table_row(
     title_cell = row.get("title", cells[1] if len(cells) > 1 else "")
     location_cell = row.get("location", cells[2] if len(cells) > 2 else "")
     application_cell = row.get("application", cells[3] if len(cells) > 3 else "")
+    uploaded_cell = row.get("age", cells[4] if len(cells) > 4 else "")
 
     company = extract_display_text(company_cell)
     title = extract_display_text(title_cell)
     location = extract_display_text(location_cell)
+    uploaded_at = extract_display_text(uploaded_cell)
     application_url = extract_best_url(application_cell) or extract_best_url(title_cell) or extract_best_url(company_cell)
 
     # Some repos use ↳ for additional roles from the same company.
@@ -595,7 +952,8 @@ def parse_table_row(
         "source_url": source_url,
         "source_type": "github_readme",
         "date_found": datetime.now(timezone.utc).isoformat(),
-        "tags": infer_tags(combined_text),
+        "uploaded_at": uploaded_at,
+        "tags": add_company_classification_tag(infer_tags(combined_text), company),
         "status": status,
     }
     return internship, previous_company
@@ -646,12 +1004,11 @@ def infer_tags(text: str) -> List[str]:
     if "intern" in lower or "co-op" in lower or "coop" in lower:
         tags.append("internship")
     return list(dict.fromkeys(tags)) or ["internship"]
-
 ```
 
 ## `scraper/linkedin_manual.py`
 
-**What it does:** Safe manual ingestion module for LinkedIn job URLs. No direct LinkedIn scraping.
+**What it does:** Safe LinkedIn manual-link ingestion.
 
 ```python
 """Safe LinkedIn manual-link ingestion.
@@ -665,6 +1022,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Dict, List
+
+from utils.tags import add_company_classification_tag
 
 
 def build_manual_linkedin_job(
@@ -682,15 +1041,15 @@ def build_manual_linkedin_job(
         "source_url": url.strip(),
         "source_type": "linkedin_manual",
         "date_found": datetime.now(timezone.utc).isoformat(),
-        "tags": tags or ["manual", "linkedin", "internship"],
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        "tags": add_company_classification_tag(tags or ["manual", "linkedin", "internship"], company),
         "status": "unknown",
     }
-
 ```
 
 ## `scraper/jobright_manual.py`
 
-**What it does:** Safe manual ingestion module for Jobright job URLs. No direct Jobright scraping.
+**What it does:** Safe Jobright manual-link ingestion.
 
 ```python
 """Safe Jobright manual-link ingestion.
@@ -703,6 +1062,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Dict, List
+
+from utils.tags import add_company_classification_tag
 
 
 def build_manual_jobright_job(
@@ -720,15 +1081,15 @@ def build_manual_jobright_job(
         "source_url": url.strip(),
         "source_type": "jobright_manual",
         "date_found": datetime.now(timezone.utc).isoformat(),
-        "tags": tags or ["manual", "jobright", "internship"],
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        "tags": add_company_classification_tag(tags or ["manual", "jobright", "internship"], company),
         "status": "unknown",
     }
-
 ```
 
 ## `database/__init__.py`
 
-**What it does:** Marks database as a Python package.
+**What it does:** See file contents below.
 
 ```python
 
@@ -736,7 +1097,7 @@ def build_manual_jobright_job(
 
 ## `database/db.py`
 
-**What it does:** SQLite database layer for deduplication, job storage, status tracking, and app state.
+**What it does:** SQLite database helpers for internship storage and duplicate detection.
 
 ```python
 """SQLite database helpers for internship storage and duplicate detection."""
@@ -745,17 +1106,25 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from utils.tags import add_company_classification_tag
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = ROOT_DIR / "internships.db"
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    # WAL lets the dashboard read while the bot writes (and vice versa) without
+    # "database is locked" errors; busy_timeout makes writers retry instead of
+    # failing immediately when they do briefly collide.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -767,11 +1136,50 @@ def normalize_value(value: str) -> str:
     return " ".join((value or "").strip().lower().split())
 
 
+_TRACKING_PARAM_PREFIXES = ("utm_",)
+_TRACKING_PARAM_NAMES = {
+    "fbclid",
+    "gclid",
+    "msclkid",
+    "mc_cid",
+    "mc_eid",
+    "ref",
+    "ref_src",
+    "source",
+    "igshid",
+}
+
+
+def strip_tracking_params(url: str) -> str:
+    """Drop known tracking params (utm_*, fbclid, ...) and any fragment.
+
+    Many ATS platforms (Greenhouse, Lever, Workday) encode the actual job id
+    in a query param, so we only remove params known to be pure tracking
+    noise rather than stripping the whole query string — otherwise two
+    different real postings could collide into the same dedupe key.
+    """
+    if not url:
+        return url
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+
+    kept_params = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key.lower() not in _TRACKING_PARAM_NAMES
+        and not key.lower().startswith(_TRACKING_PARAM_PREFIXES)
+    ]
+    new_query = urlencode(kept_params)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, ""))
+
+
 def build_dedupe_key(company: str, title: str, application_url: str) -> str:
     raw = "|".join([
         normalize_value(company),
         normalize_value(title),
-        normalize_value(application_url),
+        normalize_value(strip_tracking_params(application_url)),
     ])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -790,6 +1198,7 @@ def init_db() -> None:
                 source_url TEXT,
                 source_type TEXT,
                 tags TEXT,
+                uploaded_at TEXT,
                 first_seen TEXT NOT NULL,
                 last_seen TEXT NOT NULL,
                 posted_to_discord INTEGER DEFAULT 0,
@@ -805,7 +1214,28 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS member_profiles (
+                user_id TEXT PRIMARY KEY,
+                blurb TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        _ensure_column(conn, "internships", "uploaded_at", "TEXT")
+        _ensure_column(conn, "internships", "quality_score", "INTEGER")
+        _ensure_column(conn, "internships", "llm_reason", "TEXT")
         conn.commit()
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
+    columns = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
 def upsert_internship(internship: Dict[str, Any]) -> Tuple[int, bool]:
@@ -820,7 +1250,10 @@ def upsert_internship(internship: Dict[str, Any]) -> Tuple[int, bool]:
     application_url = internship.get("application_url") or ""
     dedupe_key = build_dedupe_key(company, title, application_url)
     current_time = now_iso()
-    tags = ",".join(internship.get("tags", []))
+    tags_list = add_company_classification_tag(internship.get("tags", []), company)
+    internship["tags"] = tags_list
+    tags = ",".join(tags_list)
+    uploaded_at = internship.get("uploaded_at") or internship.get("date_found") or ""
 
     with _connect() as conn:
         existing = conn.execute(
@@ -835,7 +1268,8 @@ def upsert_internship(internship: Dict[str, Any]) -> Tuple[int, bool]:
                 SET last_seen = ?, location = COALESCE(NULLIF(?, ''), location),
                     source_url = COALESCE(NULLIF(?, ''), source_url),
                     source_type = COALESCE(NULLIF(?, ''), source_type),
-                    tags = COALESCE(NULLIF(?, ''), tags)
+                    tags = COALESCE(NULLIF(?, ''), tags),
+                    uploaded_at = COALESCE(NULLIF(?, ''), uploaded_at)
                 WHERE dedupe_key = ?
                 """,
                 (
@@ -844,6 +1278,7 @@ def upsert_internship(internship: Dict[str, Any]) -> Tuple[int, bool]:
                     internship.get("source_url", ""),
                     internship.get("source_type", ""),
                     tags,
+                    uploaded_at,
                     dedupe_key,
                 ),
             )
@@ -854,8 +1289,8 @@ def upsert_internship(internship: Dict[str, Any]) -> Tuple[int, bool]:
             """
             INSERT INTO internships (
                 dedupe_key, company, title, location, application_url, source_url,
-                source_type, tags, first_seen, last_seen, posted_to_discord, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                source_type, tags, uploaded_at, first_seen, last_seen, posted_to_discord, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
             """,
             (
                 dedupe_key,
@@ -866,6 +1301,7 @@ def upsert_internship(internship: Dict[str, Any]) -> Tuple[int, bool]:
                 internship.get("source_url", ""),
                 internship.get("source_type", "unknown"),
                 tags,
+                uploaded_at,
                 current_time,
                 current_time,
                 internship.get("status", "unknown"),
@@ -919,6 +1355,17 @@ def get_unposted(limit: int = 20) -> List[Dict[str, Any]]:
     return [_row_to_dict(row) for row in rows]
 
 
+def update_internship_relevance(internship_id: int, quality_score: int, reason: str) -> None:
+    """Persist the local-LLM relevance judgement so the dashboard and future
+    scans (via get_unposted) can see and sort on it."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE internships SET quality_score = ?, llm_reason = ? WHERE id = ?",
+            (quality_score, reason, internship_id),
+        )
+        conn.commit()
+
+
 def update_internship_status(internship_id: int, status: str) -> None:
     allowed = {"active", "closed", "unknown", "applied", "ignored", "saved"}
     if status not in allowed:
@@ -960,16 +1407,101 @@ def stats() -> Dict[str, Any]:
     }
 
 
+def set_member_profile(user_id: str, blurb: str) -> None:
+    """Save (or replace) a premium member's short interest blurb."""
+    init_db()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO member_profiles(user_id, blurb, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET blurb = excluded.blurb, updated_at = excluded.updated_at
+            """,
+            (str(user_id), blurb, now_iso()),
+        )
+        conn.commit()
+
+
+def get_member_profile(user_id: str) -> Optional[str]:
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT blurb FROM member_profiles WHERE user_id = ?", (str(user_id),)
+        ).fetchone()
+    return row["blurb"] if row else None
+
+
+def list_member_profiles() -> Dict[str, str]:
+    """Return {user_id: blurb} for every member who has set a profile."""
+    init_db()
+    with _connect() as conn:
+        rows = conn.execute("SELECT user_id, blurb FROM member_profiles").fetchall()
+    return {row["user_id"]: row["blurb"] for row in rows}
+
+
+_PRESERVED_STATUSES = {"active", "applied", "saved"}
+
+
+def prune_old_internships(retention_days: int) -> int:
+    """Delete stale closed/unknown/ignored postings older than retention_days.
+
+    Postings a member has flagged active/applied/saved are kept regardless of
+    age — those carry personal value the rest don't. Returns rows deleted.
+    retention_days <= 0 disables pruning entirely (returns 0).
+    """
+    if retention_days <= 0:
+        return 0
+
+    init_db()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+    placeholders = ",".join("?" for _ in _PRESERVED_STATUSES)
+    with _connect() as conn:
+        cursor = conn.execute(
+            f"""
+            DELETE FROM internships
+            WHERE last_seen < ?
+              AND status NOT IN ({placeholders})
+            """,
+            (cutoff, *_PRESERVED_STATUSES),
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
+def checkpoint_and_vacuum() -> None:
+    """Flush the WAL file and reclaim disk space freed by deletes.
+
+    Cheap on a small database, so it's safe to call on every maintenance tick
+    regardless of whether pruning actually deleted anything this time.
+    """
+    conn = _connect()
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.isolation_level = None  # VACUUM can't run inside a transaction.
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
+
+
+def run_storage_maintenance(retention_days: int) -> Dict[str, int]:
+    """Prune stale rows, then checkpoint/VACUUM. Meant to run on a schedule."""
+    deleted = prune_old_internships(retention_days)
+    checkpoint_and_vacuum()
+    return {"deleted": deleted}
+
+
+def get_db_file_size_bytes() -> int:
+    return DB_PATH.stat().st_size if DB_PATH.exists() else 0
+
+
 def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     data = dict(row)
     data["tags"] = [tag for tag in (data.get("tags") or "").split(",") if tag]
     return data
-
 ```
 
 ## `dashboard/app.py`
 
-**What it does:** Optional local Flask dashboard for source management and internship status tracking.
+**What it does:** Optional local Flask dashboard.
 
 ```python
 """Optional local Flask dashboard.
@@ -982,6 +1514,8 @@ Then open:
 
 from __future__ import annotations
 
+import os
+import secrets
 import sys
 from pathlib import Path
 
@@ -990,12 +1524,40 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from flask import Flask, redirect, render_template, request, url_for
+from flask import Flask, Response, redirect, render_template, request, url_for
 
 from database.db import init_db, list_internships, update_internship_status
 from utils.source_store import add_source, load_sources, remove_source, set_source_enabled
 
 app = Flask(__name__)
+
+DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "")
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+
+
+def _auth_configured() -> bool:
+    return bool(DASHBOARD_USERNAME and DASHBOARD_PASSWORD)
+
+
+def _credentials_match(username: str, password: str) -> bool:
+    # compare_digest avoids leaking credential length/content via timing.
+    return secrets.compare_digest(username, DASHBOARD_USERNAME) and secrets.compare_digest(
+        password, DASHBOARD_PASSWORD
+    )
+
+
+@app.before_request
+def require_auth():
+    if not _auth_configured():
+        return None
+    auth = request.authorization
+    if not auth or not _credentials_match(auth.username or "", auth.password or ""):
+        return Response(
+            "Authentication required.",
+            401,
+            {"WWW-Authenticate": 'Basic realm="Internship Bot Dashboard"'},
+        )
+    return None
 
 
 @app.route("/")
@@ -1047,13 +1609,31 @@ def update_status_route():
 
 if __name__ == "__main__":
     init_db()
-    app.run(host="127.0.0.1", port=5000, debug=True)
 
+    # Defaults to loopback-only, non-debug, no auth required (nothing to
+    # protect against on your own machine). Widen DASHBOARD_HOST only on a
+    # network you trust, and set DASHBOARD_USERNAME/DASHBOARD_PASSWORD before
+    # you do — see require_auth() above.
+    host = os.getenv("DASHBOARD_HOST", "127.0.0.1")
+    debug_mode = os.getenv("DASHBOARD_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+    if debug_mode and host != "127.0.0.1":
+        raise RuntimeError(
+            "Refusing to start with DASHBOARD_DEBUG enabled while DASHBOARD_HOST "
+            "is not 127.0.0.1 — this would expose the Werkzeug debugger console."
+        )
+    if host != "127.0.0.1" and not _auth_configured():
+        raise RuntimeError(
+            "Refusing to start with DASHBOARD_HOST != 127.0.0.1 and no "
+            "DASHBOARD_USERNAME/DASHBOARD_PASSWORD set — the dashboard has no "
+            "other authentication and would be wide open on your network."
+        )
+    app.run(host=host, port=5000, debug=debug_mode)
 ```
 
 ## `dashboard/templates/index.html`
 
-**What it does:** Dashboard home page for viewing, adding, enabling, disabling, and removing sources.
+**What it does:** See file contents below.
 
 ```html
 <!doctype html>
@@ -1124,12 +1704,11 @@ if __name__ == "__main__":
   </div>
 </body>
 </html>
-
 ```
 
 ## `dashboard/templates/internships.html`
 
-**What it does:** Dashboard page for viewing found internships and updating their status.
+**What it does:** See file contents below.
 
 ```html
 <!doctype html>
@@ -1160,7 +1739,7 @@ if __name__ == "__main__":
       <table>
         <thead>
           <tr>
-            <th>Company</th><th>Role</th><th>Location</th><th>Tags</th><th>Status</th><th>Apply</th><th>First seen</th>
+            <th>Company</th><th>Role</th><th>Location</th><th>Tags</th><th>Status</th><th>Apply</th><th>Uploaded</th><th>First seen</th>
           </tr>
         </thead>
         <tbody>
@@ -1181,6 +1760,7 @@ if __name__ == "__main__":
                 </form>
               </td>
               <td><a href="{{ job.application_url }}" target="_blank">Open</a></td>
+              <td>{{ job.uploaded_at or 'Unknown' }}</td>
               <td>{{ job.first_seen }}</td>
             </tr>
           {% endfor %}
@@ -1192,12 +1772,11 @@ if __name__ == "__main__":
   </div>
 </body>
 </html>
-
 ```
 
 ## `utils/config_loader.py`
 
-**What it does:** Loads .env secrets and config.json settings, and safely saves non-secret config updates.
+**What it does:** Load and save local configuration for the internship bot.
 
 ```python
 """Load and save local configuration for the internship bot."""
@@ -1216,9 +1795,9 @@ CONFIG_PATH = ROOT_DIR / "config.json"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "discord_channel_id": "",
-    "scan_interval_minutes": 60,
-    "auto_scan_enabled": False,
-    "auto_scan_on_start": False,
+    "scan_interval_minutes": 240,
+    "auto_scan_enabled": True,
+    "auto_scan_on_start": True,
     "max_posts_per_scan": 20,
     "include_keywords": [
         "software",
@@ -1244,6 +1823,27 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "full-time",
         "new grad",
     ],
+    # Optional second-pass filtering/ranking using a local Ollama model. Off by
+    # default since it requires a running Ollama server with a model pulled.
+    "llm_filter_enabled": False,
+    "ollama_host": "http://192.168.1.84:11434",
+    "ollama_model": "llama3.2:3b",
+    "llm_timeout_seconds": 15,
+    "llm_min_quality_score": 1,
+    # Premium tier: members with this role get a personalized DM digest after
+    # each scan (see /set_premium_role, /set_profile). Empty = feature off.
+    "premium_role_id": "",
+    "personal_digest_top_n": 5,
+    "personal_digest_min_score": 4,
+    # Uptime Kuma Push-monitor heartbeat. Empty = feature off (no HTTP surface
+    # otherwise, so this is a periodic outbound ping, not an inbound check).
+    "uptime_kuma_push_url": "",
+    "heartbeat_interval_minutes": 5,
+    # Storage maintenance always runs (no external dependency); this just
+    # controls how far back it prunes. <= 0 disables pruning but still
+    # checkpoints/vacuums the database on the same schedule.
+    "data_retention_days": 180,
+    "storage_maintenance_interval_hours": 24,
 }
 
 
@@ -1261,9 +1861,26 @@ def load_config() -> Dict[str, Any]:
     if os.getenv("DISCORD_CHANNEL_ID"):
         config["discord_channel_id"] = os.getenv("DISCORD_CHANNEL_ID")
     if os.getenv("SCAN_INTERVAL_MINUTES"):
-        config["scan_interval_minutes"] = int(os.getenv("SCAN_INTERVAL_MINUTES", "60"))
+        config["scan_interval_minutes"] = int(os.getenv("SCAN_INTERVAL_MINUTES", "240"))
+    if os.getenv("AUTO_SCAN_ENABLED"):
+        config["auto_scan_enabled"] = os.getenv("AUTO_SCAN_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    if os.getenv("AUTO_SCAN_ON_START"):
+        config["auto_scan_on_start"] = os.getenv("AUTO_SCAN_ON_START", "").strip().lower() in {"1", "true", "yes", "on"}
     if os.getenv("MAX_POSTS_PER_SCAN"):
         config["max_posts_per_scan"] = int(os.getenv("MAX_POSTS_PER_SCAN", "20"))
+    if os.getenv("LLM_FILTER_ENABLED"):
+        config["llm_filter_enabled"] = os.getenv("LLM_FILTER_ENABLED", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    if os.getenv("OLLAMA_HOST"):
+        config["ollama_host"] = os.getenv("OLLAMA_HOST")
+    if os.getenv("OLLAMA_MODEL"):
+        config["ollama_model"] = os.getenv("OLLAMA_MODEL")
+    if os.getenv("UPTIME_KUMA_PUSH_URL"):
+        config["uptime_kuma_push_url"] = os.getenv("UPTIME_KUMA_PUSH_URL")
 
     config["discord_token"] = os.getenv("DISCORD_TOKEN", "")
     config["discord_guild_id"] = os.getenv("DISCORD_GUILD_ID", "")
@@ -1275,12 +1892,11 @@ def save_config(config: Dict[str, Any]) -> None:
     safe_config = {k: v for k, v in config.items() if k not in {"discord_token", "discord_guild_id"}}
     with CONFIG_PATH.open("w", encoding="utf-8") as f:
         json.dump(safe_config, f, indent=2)
-
 ```
 
 ## `utils/source_store.py`
 
-**What it does:** Reads and writes sources.json and handles add/remove/enable/disable operations.
+**What it does:** Simple JSON-backed source management.
 
 ```python
 """Simple JSON-backed source management."""
@@ -1364,28 +1980,107 @@ def set_source_enabled(source_id: str, enabled: bool) -> Optional[Dict[str, Any]
     return None
 
 
+def update_source_fetch_cache(source_id: str, resolved_raw_url: str, etag: str) -> None:
+    """Remember the raw URL and ETag that resolved successfully for a source.
+
+    Lets the next scan skip straight to the right branch instead of guessing
+    HEAD/main/master/dev again, and skip re-downloading unchanged READMEs.
+    """
+    if not source_id:
+        return
+    sources = load_sources()
+    for source in sources:
+        if source.get("id") == source_id:
+            source["resolved_raw_url"] = resolved_raw_url
+            source["etag"] = etag
+            save_sources(sources)
+            return
+
+
 def get_enabled_sources() -> List[Dict[str, Any]]:
     return [s for s in load_sources() if s.get("enabled", True)]
-
 ```
 
 ## `utils/formatting.py`
 
-**What it does:** Formats internships into Discord embeds and batches posts.
+**What it does:** Discord formatting helpers.
 
 ```python
 """Discord formatting helpers."""
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Dict, Iterable, List
 
 import discord
 
+from utils.tags import is_faang_company
+
+TAG_EMOJI = {
+    "ai": "🤖",
+    "backend": "🧱",
+    "cloud": "☁️",
+    "data": "📊",
+    "faang": "⭐",
+    "frontend": "🎨",
+    "gpu": "⚡",
+    "hardware": "🔧",
+    "internship": "🎓",
+    "jobright": "🧭",
+    "linkedin": "💼",
+    "manual": "✍️",
+    "non-faang": "🌱",
+    "quant": "📈",
+    "security": "🔒",
+    "software": "💻",
+}
+
+TAG_LABELS = {
+    "ai": "AI",
+    "faang": "FAANG",
+    "gpu": "GPU",
+    "non-faang": "Non-FAANG",
+}
+
 
 def format_tags(tags: Iterable[str]) -> str:
-    clean = [tag.strip().title() for tag in tags if tag and tag.strip()]
-    return ", ".join(dict.fromkeys(clean)) or "Unknown"
+    formatted = []
+    for tag in tags:
+        normalized = (tag or "").strip().lower()
+        if not normalized:
+            continue
+        label = TAG_LABELS.get(normalized, normalized.replace("-", " ").title())
+        emoji = TAG_EMOJI.get(normalized, "🏷️")
+        formatted.append(f"{emoji} {label}")
+    return ", ".join(dict.fromkeys(formatted)) or "🏷️ Unknown"
+
+
+def format_uploaded_at(internship: Dict) -> str:
+    uploaded_at = (
+        internship.get("uploaded_at")
+        or internship.get("first_seen")
+        or internship.get("date_found")
+        or ""
+    )
+    uploaded_at = str(uploaded_at).strip()
+    if not uploaded_at:
+        return "Unknown"
+
+    try:
+        parsed = datetime.fromisoformat(uploaded_at.replace("Z", "+00:00"))
+    except ValueError:
+        return uploaded_at
+
+    timestamp = int(parsed.timestamp())
+    return f"<t:{timestamp}:R> (<t:{timestamp}:f>)"
+
+
+def format_quality_score(quality_score: object) -> str:
+    if not isinstance(quality_score, int):
+        return ""
+    quality_score = max(1, min(5, quality_score))
+    return f"{'⭐' * quality_score}{'☆' * (5 - quality_score)} ({quality_score}/5)"
 
 
 def source_display_name(source_url: str, source_type: str) -> str:
@@ -1410,15 +2105,27 @@ def internship_to_embed(internship: Dict) -> discord.Embed:
     application_url = internship.get("application_url") or internship.get("source_url") or ""
     source_url = internship.get("source_url") or ""
     source_type = internship.get("source_type") or "unknown"
+    tag_names = [str(tag).lower() for tag in internship.get("tags", [])]
+    is_faang = "faang" in tag_names or is_faang_company(company)
 
     embed = discord.Embed(
-        title=f"{company} — {title}",
+        title=f"{company} - {title}",
         url=application_url if application_url.startswith("http") else None,
         description="New internship found.",
+        color=discord.Color.gold() if is_faang else discord.Color.teal(),
     )
     embed.add_field(name="Company", value=company, inline=True)
-    embed.add_field(name="Role", value=title, inline=False)
     embed.add_field(name="Location", value=location, inline=True)
+    embed.add_field(name="Uploaded", value=format_uploaded_at(internship), inline=True)
+    embed.add_field(name="Role", value=title, inline=False)
+
+    # Only present when llm_filter_enabled scored this posting.
+    quality_display = format_quality_score(internship.get("quality_score"))
+    if quality_display:
+        embed.add_field(name="Match", value=quality_display, inline=True)
+        llm_reason = str(internship.get("llm_reason") or "").strip()
+        if llm_reason:
+            embed.set_footer(text=llm_reason)
 
     if application_url.startswith("http"):
         embed.add_field(name="Apply", value=f"[Open application]({application_url})", inline=False)
@@ -1438,14 +2145,27 @@ def internship_to_embed(internship: Dict) -> discord.Embed:
     return embed
 
 
+def personal_match_to_embed(internship: Dict, match_score: int, reason: str) -> discord.Embed:
+    """Personalized variant of internship_to_embed for premium DM digests.
+
+    Reuses internship_to_embed for the shared fields, then foregrounds *why
+    this matches you specifically* — distinct from the server-wide "Match"
+    quality field (if llm_filter_enabled also scored this posting).
+    """
+    embed = internship_to_embed(internship)
+    embed.color = discord.Color.purple()
+    embed.description = f"**Why this matches you:** {reason}" if reason else "Personalized match."
+    embed.add_field(name="Your Match", value=format_quality_score(match_score), inline=True)
+    return embed
+
+
 def chunk_list(items: List[Dict], size: int) -> List[List[Dict]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
-
 ```
 
 ## `utils/filters.py`
 
-**What it does:** Applies include/exclude keyword filtering to normalized internships.
+**What it does:** Keyword filtering helpers.
 
 ```python
 """Keyword filtering helpers."""
@@ -1484,19 +2204,428 @@ def passes_filters(internship: Dict, include_keywords: List[str], exclude_keywor
         return False
 
     return True
-
 ```
 
-## `config.json`
+## `utils/tags.py`
 
-**What it does:** Editable local settings for channel ID, scan interval, post limits, and filters.
+**What it does:** Shared internship tag helpers.
+
+```python
+"""Shared internship tag helpers."""
+
+from __future__ import annotations
+
+import re
+from typing import Iterable, List
+
+FAANG_ALIASES = {
+    "meta": ["meta", "facebook", "instagram", "whatsapp", "oculus"],
+    "apple": ["apple"],
+    "amazon": ["amazon", "aws", "amazon web services", "audible"],
+    "netflix": ["netflix"],
+    "google": ["google", "alphabet", "youtube", "google cloud", "deepmind"],
+}
+
+
+def is_faang_company(company: str) -> bool:
+    """Return True when the company name matches a FAANG company or common alias."""
+    company_lower = (company or "").lower()
+    if not company_lower.strip():
+        return False
+
+    for aliases in FAANG_ALIASES.values():
+        for alias in aliases:
+            pattern = rf"(?<![a-z0-9]){re.escape(alias.lower())}(?![a-z0-9])"
+            if re.search(pattern, company_lower):
+                return True
+    return False
+
+
+def add_company_classification_tag(tags: Iterable[str] | str, company: str) -> List[str]:
+    """Add exactly one FAANG classification tag while preserving existing tag order."""
+    if isinstance(tags, str):
+        tags = tags.split(",")
+
+    clean_tags = []
+    for tag in tags:
+        clean = (tag or "").strip().lower()
+        if clean and clean not in {"faang", "non-faang"}:
+            clean_tags.append(clean)
+
+    clean_tags.append("faang" if is_faang_company(company) else "non-faang")
+    return list(dict.fromkeys(clean_tags))
+```
+
+## `utils/relevance.py`
+
+**What it does:** Local-LLM relevance + quality scoring for scraped internship postings.
+
+```python
+"""Local-LLM relevance + quality scoring for scraped internship postings.
+
+Keyword include/exclude filtering (utils/filters.py) is cheap but coarse — it
+lets through parser garbage and postings that only accidentally contain a
+keyword, and it can't tell a strong listing from a weak one. This adds an
+optional second pass using a small local Ollama model to:
+
+  1. Catch clearly irrelevant postings the keyword filter missed.
+  2. Score the rest 1-5 so the best postings can be prioritized when there
+     are more new postings in a scan than max_posts_per_scan can post.
+
+Disabled by default (llm_filter_enabled=false) since it requires a running
+Ollama server with a model pulled. Fails open: if Ollama is unreachable or
+returns something unusable, the posting is treated as relevant with a neutral
+score rather than being silently dropped or blocking the scan.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any, Dict
+
+from utils.ollama_client import OllamaError, generate_json
+
+LOGGER = logging.getLogger(__name__)
+
+DEFAULT_OLLAMA_HOST = "http://192.168.1.84:11434"
+DEFAULT_OLLAMA_MODEL = "llama3.2:3b"
+NEUTRAL_QUALITY_SCORE = 3
+MIN_QUALITY_SCORE = 1
+MAX_QUALITY_SCORE = 5
+
+_PROMPT_TEMPLATE = """You help a university Discord server's internship-alert bot decide \
+which postings are worth showing students.
+
+Posting:
+  Company: {company}
+  Role: {title}
+  Location: {location}
+  Existing tags: {tags}
+
+Judge this ONE posting for a CS/software/data/AI-leaning student audience. Reply with ONLY \
+a JSON object, no other text, matching this shape exactly:
+{{"relevant": true or false, "quality_score": 1-5 integer, "reason": "one short sentence"}}
+
+Guidance:
+- relevant=false only for things that are clearly not a real, in-scope internship/co-op \
+listing (e.g. parsing garbage, a full-time/senior role, something unrelated to tech).
+- quality_score reflects how strong a match this is: 5 = well-known company, clear \
+in-field role; 3 = plausible but generic or unclear; 1 = borderline/likely low value.
+"""
+
+
+@dataclass
+class RelevanceResult:
+    relevant: bool
+    quality_score: int
+    reason: str
+    source: str  # "llm" or "fallback"
+
+
+def _fallback(reason: str) -> RelevanceResult:
+    return RelevanceResult(
+        relevant=True, quality_score=NEUTRAL_QUALITY_SCORE, reason=reason, source="fallback"
+    )
+
+
+def classify_relevance(internship: Dict[str, Any], config: Dict[str, Any]) -> RelevanceResult:
+    """Judge one internship posting. Always returns a usable result (fail-open)."""
+    host = config.get("ollama_host") or DEFAULT_OLLAMA_HOST
+    model = config.get("ollama_model") or DEFAULT_OLLAMA_MODEL
+    timeout = float(config.get("llm_timeout_seconds", 15))
+
+    prompt = _PROMPT_TEMPLATE.format(
+        company=internship.get("company", "Unknown"),
+        title=internship.get("title", "Unknown"),
+        location=internship.get("location", "Unknown"),
+        tags=", ".join(internship.get("tags", [])) or "none",
+    )
+
+    try:
+        parsed = generate_json(host=host, model=model, prompt=prompt, timeout=timeout)
+    except OllamaError as exc:
+        LOGGER.warning("Relevance check failed, keeping posting by default: %s", exc)
+        return _fallback("Ollama unavailable; kept by default")
+
+    try:
+        relevant = bool(parsed["relevant"])
+        quality_score = int(parsed["quality_score"])
+        reason = str(parsed.get("reason", "")).strip() or "No reason given"
+    except (KeyError, TypeError, ValueError) as exc:
+        LOGGER.warning("Relevance check returned an unexpected shape %r: %s", parsed, exc)
+        return _fallback("Unexpected model output; kept by default")
+
+    quality_score = max(MIN_QUALITY_SCORE, min(MAX_QUALITY_SCORE, quality_score))
+    return RelevanceResult(relevant=relevant, quality_score=quality_score, reason=reason, source="llm")
+```
+
+## `utils/personalization.py`
+
+**What it does:** Per-member personalized match scoring for the premium tier.
+
+```python
+"""Per-member personalized match scoring for the premium tier.
+
+utils/relevance.py scores a posting once for the whole server. This scores it
+again per premium member against their own short interest blurb (set via
+/set_profile), so the personalized DM digest can surface only what's actually
+relevant to *that* person instead of just the server-wide ranking.
+
+Same fail-open contract as utils/relevance.py: if Ollama is unreachable or
+returns something unusable, callers get a neutral score back rather than an
+exception — a flaky LLM call should never crash a scan or block the digest.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any, Dict
+
+from utils.ollama_client import OllamaError, generate_json
+from utils.relevance import DEFAULT_OLLAMA_HOST, DEFAULT_OLLAMA_MODEL, NEUTRAL_QUALITY_SCORE
+
+LOGGER = logging.getLogger(__name__)
+
+MIN_MATCH_SCORE = 1
+MAX_MATCH_SCORE = 5
+
+_PROMPT_TEMPLATE = """A student described what internships they're interested in:
+"{profile_blurb}"
+
+Judge how well this ONE posting matches THEIR stated interests specifically \
+(not just whether it's a reasonable internship in general):
+  Company: {company}
+  Role: {title}
+  Location: {location}
+  Tags: {tags}
+
+Reply with ONLY a JSON object, no other text, matching this shape exactly:
+{{"match_score": 1-5 integer, "reason": "one short sentence addressed to the student, e.g. 'Matches your interest in backend/Go roles'"}}
+
+Guidance: 5 = strongly matches their stated interests; 3 = plausible but not a clear \
+match to what they described; 1 = doesn't match their stated interests at all.
+"""
+
+
+@dataclass
+class PersonalMatchResult:
+    match_score: int
+    reason: str
+    source: str  # "llm" or "fallback"
+
+
+def _fallback(reason: str) -> PersonalMatchResult:
+    return PersonalMatchResult(match_score=NEUTRAL_QUALITY_SCORE, reason=reason, source="fallback")
+
+
+def score_personal_match(
+    internship: Dict[str, Any], profile_blurb: str, config: Dict[str, Any]
+) -> PersonalMatchResult:
+    """Judge one posting against one member's profile blurb. Always returns a
+    usable result (fail-open)."""
+    host = config.get("ollama_host") or DEFAULT_OLLAMA_HOST
+    model = config.get("ollama_model") or DEFAULT_OLLAMA_MODEL
+    timeout = float(config.get("llm_timeout_seconds", 15))
+
+    prompt = _PROMPT_TEMPLATE.format(
+        profile_blurb=profile_blurb,
+        company=internship.get("company", "Unknown"),
+        title=internship.get("title", "Unknown"),
+        location=internship.get("location", "Unknown"),
+        tags=", ".join(internship.get("tags", [])) or "none",
+    )
+
+    try:
+        parsed = generate_json(host=host, model=model, prompt=prompt, timeout=timeout)
+    except OllamaError as exc:
+        LOGGER.warning("Personal match check failed, using neutral score: %s", exc)
+        return _fallback("Ollama unavailable; neutral score used")
+
+    try:
+        match_score = int(parsed["match_score"])
+        reason = str(parsed.get("reason", "")).strip() or "No reason given"
+    except (KeyError, TypeError, ValueError) as exc:
+        LOGGER.warning("Personal match check returned an unexpected shape %r: %s", parsed, exc)
+        return _fallback("Unexpected model output; neutral score used")
+
+    match_score = max(MIN_MATCH_SCORE, min(MAX_MATCH_SCORE, match_score))
+    return PersonalMatchResult(match_score=match_score, reason=reason, source="llm")
+```
+
+## `utils/ollama_client.py`
+
+**What it does:** Thin HTTP client for a local Ollama server.
+
+```python
+"""Thin HTTP client for a local Ollama server.
+
+Kept separate from utils/relevance.py so the HTTP/JSON plumbing can be tested
+(and swapped) independently of the prompt and result-parsing logic.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Dict
+
+import requests
+
+LOGGER = logging.getLogger(__name__)
+
+
+class OllamaError(Exception):
+    """Raised when the local Ollama server can't be reached or errors out."""
+
+
+def generate_json(host: str, model: str, prompt: str, timeout: float = 15.0) -> Dict[str, Any]:
+    """Ask Ollama to generate a single JSON object and return it parsed.
+
+    Raises OllamaError on any network/HTTP/JSON failure so callers decide how
+    to fail — this module never guesses at a fallback value itself.
+    """
+    url = host.rstrip("/") + "/api/generate"
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "format": "json",
+        "stream": False,
+        "options": {"temperature": 0},
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=timeout)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise OllamaError(f"Could not reach Ollama at {url}: {exc}") from exc
+
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise OllamaError(f"Ollama returned a non-JSON response body: {exc}") from exc
+
+    raw_text = body.get("response", "")
+    try:
+        return json.loads(raw_text)
+    except (TypeError, ValueError) as exc:
+        raise OllamaError(f"Ollama's model output wasn't valid JSON: {raw_text!r}") from exc
+```
+
+## `utils/email_digest_template.py`
+
+**What it does:** Future email digest template for internship alerts.
+
+```python
+"""Future email digest template for internship alerts.
+
+This module only renders email content. It does not send email or read subscriber
+records yet. Later, a scheduled worker can call this once per hour with jobs from
+the database and send the returned subject/text/html to subscribed users.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from html import escape
+from typing import Dict, Iterable, List
+
+
+def render_hourly_email_digest(jobs: Iterable[Dict], generated_at: datetime | None = None) -> Dict[str, str]:
+    """Return subject, text, and HTML bodies for an hourly internship digest."""
+    generated_at = generated_at or datetime.now(timezone.utc)
+    job_list = list(jobs)
+    subject = f"{len(job_list)} new internship opportunities"
+
+    if not job_list:
+        return {
+            "subject": "No new internship opportunities this hour",
+            "text": "No new internship opportunities were found in the latest hourly digest.",
+            "html": "<p>No new internship opportunities were found in the latest hourly digest.</p>",
+        }
+
+    return {
+        "subject": subject,
+        "text": _render_text(job_list, generated_at),
+        "html": _render_html(job_list, generated_at),
+    }
+
+
+def _render_text(jobs: List[Dict], generated_at: datetime) -> str:
+    lines = [
+        "New internship opportunities",
+        f"Generated: {generated_at.isoformat()}",
+        "",
+    ]
+
+    for index, job in enumerate(jobs, start=1):
+        lines.extend(
+            [
+                f"{index}. {job.get('company', 'Unknown Company')} - {job.get('title', 'Internship')}",
+                f"   Location: {job.get('location', 'Unknown')}",
+                f"   Uploaded: {job.get('uploaded_at') or job.get('first_seen') or 'Unknown'}",
+                f"   Tags: {_format_plain_tags(job.get('tags', []))}",
+                f"   Apply: {job.get('application_url') or job.get('source_url') or 'No link available'}",
+                "",
+            ]
+        )
+
+    return "\n".join(lines).strip()
+
+
+def _render_html(jobs: List[Dict], generated_at: datetime) -> str:
+    items = []
+    for job in jobs:
+        company = escape(str(job.get("company", "Unknown Company")))
+        title = escape(str(job.get("title", "Internship")))
+        location = escape(str(job.get("location", "Unknown")))
+        uploaded = escape(str(job.get("uploaded_at") or job.get("first_seen") or "Unknown"))
+        tags = escape(_format_plain_tags(job.get("tags", [])))
+        url = escape(str(job.get("application_url") or job.get("source_url") or ""))
+        apply_link = f'<a href="{url}">Apply</a>' if url.startswith("http") else "No link available"
+
+        items.append(
+            f"""
+            <li style="margin: 0 0 18px;">
+              <strong>{company} - {title}</strong><br>
+              Location: {location}<br>
+              Uploaded: {uploaded}<br>
+              Tags: {tags}<br>
+              {apply_link}
+            </li>
+            """
+        )
+
+    return f"""
+    <section style="font-family: Arial, sans-serif; color: #1f2937;">
+      <h1 style="font-size: 22px;">New internship opportunities</h1>
+      <p style="color: #6b7280;">Generated: {escape(generated_at.isoformat())}</p>
+      <ul style="padding-left: 20px;">
+        {''.join(items)}
+      </ul>
+    </section>
+    """.strip()
+
+
+def _format_plain_tags(tags: object) -> str:
+    if isinstance(tags, str):
+        return tags or "Unknown"
+    if isinstance(tags, list):
+        return ", ".join(str(tag) for tag in tags if str(tag).strip()) or "Unknown"
+    return "Unknown"
+```
+
+## `config.example.json`
+
+**What it does:** See file contents below.
 
 ```json
 {
   "discord_channel_id": "",
-  "scan_interval_minutes": 60,
-  "auto_scan_enabled": false,
-  "auto_scan_on_start": false,
+  "scan_interval_minutes": 240,
+  "auto_scan_enabled": true,
+  "auto_scan_on_start": true,
   "max_posts_per_scan": 20,
   "include_keywords": [
     "software",
@@ -1521,51 +2650,53 @@ def passes_filters(internship: Dict, include_keywords: List[str], exclude_keywor
     "principal",
     "full-time",
     "new grad"
-  ]
+  ],
+  "llm_filter_enabled": false,
+  "ollama_host": "http://192.168.1.84:11434",
+  "ollama_model": "llama3.2:3b",
+  "llm_timeout_seconds": 15,
+  "llm_min_quality_score": 1,
+  "premium_role_id": "",
+  "personal_digest_top_n": 5,
+  "personal_digest_min_score": 4,
+  "uptime_kuma_push_url": "",
+  "heartbeat_interval_minutes": 5,
+  "data_retention_days": 180,
+  "storage_maintenance_interval_hours": 24
 }
-
 ```
 
-## `sources.json`
+## `sources.example.json`
 
-**What it does:** Sample saved GitHub internship sources with IDs, URLs, type, enabled status, and date added.
+**What it does:** See file contents below.
 
 ```json
-[
-  {
-    "id": "simp2026",
-    "url": "https://github.com/SimplifyJobs/Summer2026-Internships?tab=readme-ov-file",
-    "type": "github_readme",
-    "enabled": true,
-    "date_added": "2026-07-02T00:00:00+00:00"
-  },
-  {
-    "id": "zapp2027",
-    "url": "https://github.com/zapplyjobs/Internships-2027#%EF%B8%8F-hardware--engineering",
-    "type": "github_readme",
-    "enabled": true,
-    "date_added": "2026-07-02T00:00:00+00:00"
-  }
-]
-
+[]
 ```
 
 ## `requirements.txt`
 
-**What it does:** Python dependencies needed to run the bot and optional dashboard.
+**What it does:** See file contents below.
 
 ```text
 discord.py>=2.4.0
 python-dotenv>=1.0.1
 requests>=2.32.0
-beautifulsoup4>=4.12.0
 Flask>=3.0.0
+```
 
+## `requirements-dev.txt`
+
+**What it does:** See file contents below.
+
+```text
+-r requirements.txt
+pytest>=8.0.0
 ```
 
 ## `.env.example`
 
-**What it does:** Template for local secrets and optional environment overrides.
+**What it does:** See file contents below.
 
 ```env
 # Required: paste your Discord bot token here.
@@ -1581,52 +2712,193 @@ DISCORD_CHANNEL_ID=
 
 # Optional overrides. If blank, config.json values are used.
 SCAN_INTERVAL_MINUTES=
+AUTO_SCAN_ENABLED=
+AUTO_SCAN_ON_START=
 MAX_POSTS_PER_SCAN=
 
+# Optional dashboard settings (see `python dashboard/app.py`).
+# Leave DASHBOARD_HOST unset (defaults to 127.0.0.1) unless you need the
+# dashboard reachable from other machines. If you do widen it, set both
+# DASHBOARD_USERNAME and DASHBOARD_PASSWORD first — the dashboard refuses to
+# start on a non-loopback host without them.
+DASHBOARD_HOST=
+DASHBOARD_DEBUG=
+DASHBOARD_USERNAME=
+DASHBOARD_PASSWORD=
+
+# Optional: local-LLM relevance/quality scoring (see config.json's
+# llm_filter_enabled). Requires a running Ollama server with the model
+# already pulled (docker exec ollama ollama pull llama3.2:3b). Off unless
+# llm_filter_enabled is true in config.json.
+OLLAMA_HOST=
+OLLAMA_MODEL=
+LLM_FILTER_ENABLED=
+
+# Optional: Uptime Kuma Push-monitor heartbeat (see config.json's
+# uptime_kuma_push_url / heartbeat_interval_minutes). The full push URL
+# includes an opaque per-monitor token, so it's treated like a secret here
+# rather than in config.json. Leave blank to disable.
+UPTIME_KUMA_PUSH_URL=
 ```
 
 ## `.gitignore`
 
-**What it does:** Prevents secrets, database files, and virtual environments from being committed.
+**What it does:** See file contents below.
 
 ```gitignore
 .env
 internships.db
+config.json
+sources.json
 __pycache__/
 *.pyc
 .venv/
 venv/
 instance/
+```
 
+## `docker-compose.yml`
+
+**What it does:** See file contents below.
+
+```yaml
+services:
+  internship-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: internship-bot
+    restart: unless-stopped
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN}
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
+      DISCORD_CHANNEL_ID: ${DISCORD_CHANNEL_ID:-}
+      SCAN_INTERVAL_MINUTES: ${SCAN_INTERVAL_MINUTES:-240}
+      AUTO_SCAN_ENABLED: ${AUTO_SCAN_ENABLED:-true}
+      AUTO_SCAN_ON_START: ${AUTO_SCAN_ON_START:-true}
+      MAX_POSTS_PER_SCAN: ${MAX_POSTS_PER_SCAN:-20}
+      PYTHONUNBUFFERED: 1
+    volumes:
+      # Bind mount for development hot reload
+      - ./bot.py:/app/bot.py:ro
+      - ./scanner.py:/app/scanner.py:ro
+      - ./config.json:/app/config.json
+      - ./database:/app/database:ro
+      - ./scraper:/app/scraper:ro
+      - ./utils:/app/utils:ro
+      # Persist database and config across restarts
+      - internship_data:/app
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  internship_data:
+```
+
+## `Dockerfile`
+
+**What it does:** See file contents below.
+
+```dockerfile
+# Build stage
+FROM python:3.12-slim AS builder
+
+WORKDIR /tmp
+
+# Copy only requirements to leverage layer caching
+COPY requirements.txt .
+
+# Install dependencies to a virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Runtime stage
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Copy virtual environment from builder
+COPY --from=builder /opt/venv /opt/venv
+
+# Copy application code
+COPY . .
+
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Health check (bot is responsive if it can import)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import bot; print('OK')" || exit 1
+
+CMD ["python", "bot.py"]
+```
+
+## `.dockerignore`
+
+**What it does:** See file contents below.
+
+```gitignore
+.env
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.coverage
+htmlcov
+dist
+build
+*.egg-info
+.DS_Store
+internships.db
+node_modules
+.idea
+.vscode
+*.log
 ```
 
 ## `README.md`
 
-**What it does:** Beginner-friendly setup, Discord Developer Portal, run, troubleshooting, and upgrade guide.
+**What it does:** See file contents below.
 
 ```markdown
 # Discord Internship Bot
 
-A beginner-friendly Discord bot that runs locally on your Windows laptop and posts internship opportunities into a private Discord channel.
+A beginner-friendly Discord bot that runs locally, scans public GitHub internship README sources, stores opportunities in SQLite, and posts new internship alerts into a Discord channel.
 
-The MVP supports public GitHub internship README repositories. LinkedIn and Jobright are supported through safe manual link ingestion instead of direct scraping.
+LinkedIn and Jobright are supported through safe manual link ingestion instead of direct scraping.
 
 ## What this bot does
 
-- Runs only when you start it locally.
-- Scans enabled GitHub README sources.
-- Parses Markdown internship tables.
+- Automatically scans enabled GitHub README sources every 4 hours while the bot is running.
+- Runs one scan on startup by default.
+- Posts only new internships that have not already been posted to Discord.
 - Stores jobs in local SQLite: `internships.db`.
 - Avoids duplicate Discord posts using company + role + application link.
-- Posts clean embeds into your private Discord channel.
+- Includes upload/source age info in Discord posts when the source provides it.
+- Adds a FAANG or Non-FAANG tag to each opportunity.
+- Adds emoji-powered tags to make Discord posts easier to scan.
 - Lets you manage GitHub sources with slash commands.
 - Includes an optional local dashboard at `http://localhost:5000`.
+- Includes a future hourly email digest template in `utils/email_digest_template.py`.
 
 ## Important LinkedIn and Jobright note
 
 This project does **not** directly scrape LinkedIn or Jobright.
 
-LinkedIn commonly blocks bots and states that crawlers/bots/extensions that scrape or automate LinkedIn are not permitted. Job boards also often change layouts, require login, block automated traffic, or restrict automated extraction in their terms. Because of that, this bot uses safer alternatives:
+LinkedIn commonly blocks bots and many job boards restrict automated extraction. Because of that, this bot uses safer alternatives:
 
 - Paste a job URL manually with `/add_manual_job`.
 - Use saved job links you personally found.
@@ -1637,32 +2909,34 @@ LinkedIn commonly blocks bots and states that crawlers/bots/extensions that scra
 
 ```text
 discord-internship-bot/
-├── bot.py
-├── scanner.py
-├── scraper/
-│   ├── __init__.py
-│   ├── github_scraper.py
-│   ├── linkedin_manual.py
-│   └── jobright_manual.py
-├── database/
-│   ├── __init__.py
-│   └── db.py
-├── dashboard/
-│   ├── app.py
-│   └── templates/
-│       ├── index.html
-│       └── internships.html
-├── utils/
-│   ├── config_loader.py
-│   ├── source_store.py
-│   ├── formatting.py
-│   └── filters.py
-├── config.json
-├── sources.json
-├── requirements.txt
-├── README.md
-├── .env.example
-└── .gitignore
+|-- bot.py
+|-- scanner.py
+|-- scraper/
+|   |-- __init__.py
+|   |-- github_scraper.py
+|   |-- linkedin_manual.py
+|   `-- jobright_manual.py
+|-- database/
+|   |-- __init__.py
+|   `-- db.py
+|-- dashboard/
+|   |-- app.py
+|   `-- templates/
+|       |-- index.html
+|       `-- internships.html
+|-- utils/
+|   |-- config_loader.py
+|   |-- email_digest_template.py
+|   |-- filters.py
+|   |-- formatting.py
+|   |-- source_store.py
+|   `-- tags.py
+|-- config.json
+|-- sources.json
+|-- requirements.txt
+|-- README.md
+|-- .env.example
+`-- .gitignore
 ```
 
 ## Setup guide for Windows
@@ -1731,6 +3005,149 @@ DISCORD_TOKEN=your_real_token_here
 
 Do not share this token. Do not commit `.env` to GitHub.
 
+### 6. Create your `config.json` and `sources.json`
+
+These hold your live channel ID and saved sources, and are gitignored so your personal
+settings never get committed. Copy the templates:
+
+```powershell
+copy config.example.json config.json
+copy sources.example.json sources.json
+```
+
+You do not need to edit them by hand — `/set_channel` and `/add_source` (or the
+dashboard) fill these in for you.
+
+## Docker setup guide
+
+Use Docker if you want the bot to keep running in a container instead of directly in your Windows PowerShell session.
+
+### 1. Install Docker Desktop
+
+1. Install Docker Desktop for Windows.
+2. Start Docker Desktop.
+3. Open PowerShell in this project folder.
+4. Confirm Docker works:
+
+```powershell
+docker --version
+```
+
+### 2. Create your `.env` file
+
+If you have not already created it, copy the example file:
+
+```powershell
+copy .env.example .env
+```
+
+Edit `.env` and set at least:
+
+```env
+DISCORD_TOKEN=your_real_token_here
+```
+
+Optional but recommended while testing:
+
+```env
+DISCORD_GUILD_ID=your_server_id_here
+```
+
+You can also set the posting channel in `.env` if you already know it:
+
+```env
+DISCORD_CHANNEL_ID=your_channel_id_here
+```
+
+Otherwise, run `/set_channel` in Discord after the bot starts.
+
+### 3. Create your `config.json` and `sources.json`
+
+```powershell
+copy config.example.json config.json
+copy sources.example.json sources.json
+```
+
+Both are gitignored and mounted into the container so they persist across rebuilds.
+
+### 5. Check the `Dockerfile`
+
+The project includes a multi-stage `Dockerfile` (dependencies build in one stage, the
+runtime image only copies the installed virtual environment and the app code, keeping
+the final image smaller) that ends with:
+
+```dockerfile
+CMD ["python", "bot.py"]
+```
+
+### 6. Check `.dockerignore`
+
+The project includes a `.dockerignore` that keeps secrets, your local virtual
+environment, caches, and your local database out of the Docker build context.
+
+### 7. Build the Docker image
+
+```powershell
+docker build -t discord-internship-bot .
+```
+
+### 8. Run the bot container
+
+This command starts the bot and mounts the project folder into the container so `config.json`, `sources.json`, and `internships.db` persist on your computer:
+
+```powershell
+docker run --name discord-internship-bot --env-file .env -v ${PWD}:/app discord-internship-bot
+```
+
+If the bot starts correctly, you should see logs saying it logged into Discord and synced slash commands.
+
+### 9. Stop and restart the container
+
+Stop it:
+
+```powershell
+docker stop discord-internship-bot
+```
+
+Start it again:
+
+```powershell
+docker start -a discord-internship-bot
+```
+
+If you changed code or dependencies, rebuild and recreate the container:
+
+```powershell
+docker stop discord-internship-bot
+docker rm discord-internship-bot
+docker build -t discord-internship-bot .
+docker run --name discord-internship-bot --env-file .env -v ${PWD}:/app discord-internship-bot
+```
+
+### Optional: run the dashboard in Docker
+
+The dashboard binds to `127.0.0.1` and runs with Flask debug mode off by default, and
+it refuses to start on a non-loopback host unless `DASHBOARD_USERNAME` and
+`DASHBOARD_PASSWORD` are both set. To access it from your browser through Docker, set
+those plus `DASHBOARD_HOST=0.0.0.0` when running the container:
+
+```powershell
+docker run --name internship-dashboard --env-file .env -e DASHBOARD_HOST=0.0.0.0 -e DASHBOARD_USERNAME=youruser -e DASHBOARD_PASSWORD=yourpassword -p 5000:5000 -v ${PWD}:/app discord-internship-bot python dashboard/app.py
+```
+
+Open:
+
+```text
+http://localhost:5000
+```
+
+You'll be prompted for the username/password (HTTP Basic Auth) once `DASHBOARD_HOST`
+is widened. Only do this on a network you trust — never expose it to the public
+internet. Never set `DASHBOARD_DEBUG=true` unless you're debugging locally with
+`DASHBOARD_HOST` left at `127.0.0.1`: Flask's debug mode exposes an unauthenticated
+interactive Python console over HTTP whenever a route raises, which is a remote
+code execution risk the moment the dashboard is reachable from anywhere else.
+
 ## Discord bot creation guide
 
 ### 1. Create a Discord application
@@ -1750,9 +3167,13 @@ Do not share this token. Do not commit `.env` to GitHub.
 
 ### 3. Enable intents
 
-This MVP uses slash commands and does not need Message Content Intent.
+This bot uses slash commands and does not need Message Content Intent — leave that off.
 
-You can leave privileged intents off unless you later add text-prefix commands or member-reading features.
+It **does** require the **Server Members Intent** (a privileged intent), because the
+premium-tier personalized DM digest needs to resolve which members hold the premium
+role. Turn this on in the **Bot** tab, under **Privileged Gateway Intents**, even if
+you're not using the premium tier yet — the bot requests it unconditionally, and
+Discord will refuse the connection with `PrivilegedIntentsRequired` if it's off.
 
 ### 4. Create the invite URL
 
@@ -1827,15 +3248,36 @@ In your private Discord channel, run:
 
 This saves the current channel ID into `config.json`.
 
-### Scan internships
+### Automatic scans
 
-Run:
+By default, `config.json` is set to:
+
+```json
+{
+  "scan_interval_minutes": 240,
+  "auto_scan_enabled": true,
+  "auto_scan_on_start": true
+}
+```
+
+That means:
+
+- The bot runs one scan when it starts.
+- The bot scans again every 4 hours.
+- Only new jobs are posted to Discord.
+- Jobs already posted stay in SQLite and are not posted again.
+
+The bot still only runs while your laptop is on and `python bot.py` is running.
+
+### Manual scan
+
+You can still run a scan any time:
 
 ```text
 /scan
 ```
 
-The bot will scan enabled GitHub sources, store jobs in SQLite, and post new jobs into the configured channel.
+The bot scans enabled GitHub sources, stores jobs in SQLite, and posts new jobs into the configured channel.
 
 ### Stop the bot
 
@@ -1845,16 +3287,44 @@ In PowerShell, press:
 Ctrl + C
 ```
 
+## Discord post format
+
+Each new internship embed includes:
+
+- Company
+- Role
+- Location
+- Uploaded time or source age, when available
+- Apply link
+- Source link
+- Emoji tags
+- FAANG or Non-FAANG classification
+
+Example tags:
+
+```text
+💻 Software, 🎓 Internship, ⭐ FAANG
+```
+
+```text
+📊 Data, 🌱 Non-FAANG
+```
+
+FAANG detection currently covers common aliases for Meta/Facebook, Apple, Amazon/AWS, Netflix, and Google/Alphabet.
+
 ## Discord commands
 
-- `/scan` — manually scan all enabled GitHub sources.
-- `/add_source <url>` — add a new GitHub internship repository or README URL.
-- `/list_sources` — show all saved sources.
-- `/remove_source <url_or_id>` — remove a source by ID or exact URL.
-- `/set_channel` — set the current channel as the posting channel.
-- `/status` — show bot status, number of sources, last scan time, and job counts.
-- `/add_manual_job <source> <url> [company] [title] [location]` — manually save a LinkedIn or Jobright link.
-- `/help` — show available commands.
+- `/scan` - manually scan all enabled GitHub sources.
+- `/add_source <url>` - add a new GitHub internship repository or README URL.
+- `/list_sources` - show all saved sources.
+- `/remove_source <url_or_id>` - remove a source by ID or exact URL.
+- `/set_channel` - set the current channel as the posting channel.
+- `/status` - show bot status, schedule, last scan time, and job counts.
+- `/add_manual_job <source> <url> [company] [title] [location]` - manually save a LinkedIn or Jobright link.
+- `/set_premium_role <role>` - admin only: set which role gets personalized DM digests.
+- `/set_profile <blurb>` - premium members: set your interests for personalized matching.
+- `/my_profile` - show your saved profile and premium status.
+- `/help` - show available commands.
 
 ## Add more GitHub internship links
 
@@ -1885,25 +3355,168 @@ Edit `config.json`:
 ```json
 {
   "discord_channel_id": "",
-  "scan_interval_minutes": 60,
-  "auto_scan_enabled": false,
-  "auto_scan_on_start": false,
+  "scan_interval_minutes": 240,
+  "auto_scan_enabled": true,
+  "auto_scan_on_start": true,
   "max_posts_per_scan": 20,
   "include_keywords": ["software", "swe", "intern", "data", "ai", "quant", "gpu", "cuda"],
   "exclude_keywords": ["senior", "staff", "principal", "full-time", "new grad"]
 }
 ```
 
-Recommended beginner setting: keep `auto_scan_enabled` as `false` and use `/scan` manually until everything works.
+Optional `.env` overrides:
 
-If you want scheduled scanning while the bot is running locally, set:
-
-```json
-"auto_scan_enabled": true,
-"scan_interval_minutes": 60
+```env
+SCAN_INTERVAL_MINUTES=240
+AUTO_SCAN_ENABLED=true
+AUTO_SCAN_ON_START=true
+MAX_POSTS_PER_SCAN=20
 ```
 
-The bot still only runs while your laptop is on and `python bot.py` is running.
+## Optional local-LLM relevance and quality scoring
+
+The keyword include/exclude filter above is cheap but coarse: it can't tell a strong
+posting from a weak one, and it lets through the occasional parser mistake as long as
+a keyword happens to match. If you have a local Ollama server, the bot can run a
+second pass that judges each new posting for relevance and gives it a 1-5 quality
+score, so when a scan finds more postings than `max_posts_per_scan` can send at once,
+the strongest matches win the scarce slots instead of whichever happened to appear
+first in a README.
+
+Enable it in `config.json`:
+
+```json
+{
+  "llm_filter_enabled": true,
+  "ollama_host": "http://192.168.1.84:11434",
+  "ollama_model": "llama3.2:3b",
+  "llm_timeout_seconds": 15,
+  "llm_min_quality_score": 1
+}
+```
+
+Or via `.env`: `LLM_FILTER_ENABLED=true`, `OLLAMA_HOST=...`, `OLLAMA_MODEL=...`.
+
+Make sure the model is pulled first:
+
+```bash
+docker exec ollama ollama pull llama3.2:3b
+```
+
+Notes:
+
+- **Off by default.** Nothing changes until `llm_filter_enabled` is `true`.
+- **Fails open.** If Ollama is unreachable, slow, or returns something unusable, the
+  posting is kept with a neutral score rather than dropped — a flaky LLM call should
+  never cause a real internship to go unposted.
+- **Only runs on new postings**, after the keyword filter, so it's not spending a
+  model call on every row of every README on every scan.
+- **`llm_min_quality_score`** (1-5) additionally drops postings scored below the
+  threshold, on top of the model's own relevant/not-relevant judgement. Leave at `1`
+  to only filter, not additionally threshold.
+- Scored postings show a star rating ("Match") and the model's one-line reason (as
+  the embed footer) in Discord; unscored postings (feature off, or the fallback path)
+  show neither.
+
+## Optional premium tier: personalized DM digests
+
+Everything above ranks/filters postings the same way for the whole server. The
+premium tier adds a second, *personalized* layer on top for members your organization
+has marked as paid/premium — it doesn't change or gate anything the rest of the
+server sees.
+
+There's no billing integration here at all. "Premium" is just a Discord role your
+officers assign the same way you'd assign any other role (e.g. when dues are paid) —
+the bot only checks whether a member holds that role.
+
+**Setup:**
+
+1. Create a role in your server for premium members (any name).
+2. Make sure **Server Members Intent** is enabled (see the intents step above) —
+   required for the bot to know who holds the role.
+3. Run `/set_premium_role @YourPremiumRole` (admin/Manage Server permission required).
+4. Premium members run `/set_profile` with 1-3 sentences describing what they're
+   looking for, e.g. `"Backend/Go internships, remote OK, sophomore, open to startups"`.
+   `/my_profile` shows what's currently saved.
+
+That's it — after every scan, each premium member with a saved profile gets DMed
+their top matches from that scan (ranked and explained against *their* blurb, not
+just the server-wide ranking), in addition to the shared channel post everyone gets.
+
+Config (`config.json`):
+
+```json
+{
+  "premium_role_id": "",
+  "personal_digest_top_n": 5,
+  "personal_digest_min_score": 4
+}
+```
+
+- **`personal_digest_top_n`** — max postings DMed per member per scan.
+- **`personal_digest_min_score`** (1-5) — only DM postings scored at or above this
+  personal-fit score; keeps digests from including a "meh" match just to fill five
+  slots.
+- Uses the same `ollama_host`/`ollama_model`/`llm_timeout_seconds` settings as the
+  server-wide LLM filter above, and the same fail-open behavior — if Ollama is
+  unreachable, that member's digest is silently skipped for this scan rather than
+  DMing them something broken or blocking the shared-channel post.
+- If a premium member has DMs closed to the bot, they're skipped (logged, not
+  retried) — it doesn't affect anyone else's digest or the shared channel post.
+
+## Uptime monitoring (Uptime Kuma)
+
+The bot has no HTTP server, so it can't be health-checked the usual way (something
+pinging a `/health` endpoint). Instead it pushes a heartbeat *out* to an Uptime Kuma
+[Push monitor](https://github.com/louislam/uptime-kuma) on a timer — if the process
+dies, hangs, or loses its connection, the pings stop arriving and Kuma flags it down
+using whatever alerting you've already got configured there.
+
+**Setup, in Uptime Kuma:**
+
+1. Add New Monitor → Monitor Type: **Push**.
+2. Set the **Heartbeat Interval** to something a bit longer than
+   `heartbeat_interval_minutes` below (e.g. 2x it), so a single missed tick doesn't
+   immediately page you.
+3. Save, then copy the Push URL it gives you
+   (`http://<kuma-host>:3001/api/push/<token>?status=up&msg=OK&ping=`).
+
+**Setup, in this bot** (`.env`, since the URL contains an auth token):
+
+```env
+UPTIME_KUMA_PUSH_URL=http://192.168.1.84:3001/api/push/your-token-here
+```
+
+Optional (`config.json`): `heartbeat_interval_minutes` (default `5`).
+
+Notes:
+
+- **Off by default** — nothing pings anywhere until `UPTIME_KUMA_PUSH_URL` is set.
+- This is a liveness check only (bot process alive and connected to Discord), not a
+  "is everything working perfectly" check — Ollama being down, for instance, doesn't
+  stop the heartbeat, since the LLM features already fail open gracefully instead of
+  crashing. If you want that level of detail, `/status` shows it directly.
+- A failed push (Kuma unreachable) is logged and dropped, not retried — the next
+  scheduled tick tries again on its own.
+
+## Storage maintenance
+
+Nothing in the bot ever prunes on its own by default in most bots — this one does,
+so `internships.db` doesn't grow forever on a server that's meant to run for months.
+A daily background task (`storage_maintenance_interval_hours`, default `24`):
+
+1. Deletes postings older than `data_retention_days` (default `180`) whose status is
+   still `closed`, `unknown`, or `ignored`. Postings marked `active`, `applied`, or
+   `saved` (via the dashboard) are **never** auto-deleted, regardless of age — those
+   carry personal value that outweighs the storage cost.
+2. Runs `PRAGMA wal_checkpoint(TRUNCATE)` and `VACUUM` to flush the WAL file and
+   reclaim disk space the deletes freed up.
+
+This always runs (no config flag to enable it — it has no external dependency and is
+cheap even when there's nothing to prune). Set `data_retention_days` to `0` or
+negative to disable the pruning step specifically while still keeping the
+checkpoint/VACUUM housekeeping. Check current database size and retention settings
+any time with `/status`.
 
 ## Optional dashboard
 
@@ -1929,7 +3542,32 @@ Dashboard features:
 - Add a GitHub source URL.
 - Enable/disable sources.
 - View found internships.
+- See uploaded/source age and first-seen time.
 - Mark internships as `saved`, `applied`, `ignored`, `closed`, etc.
+
+## Future hourly email digest
+
+The project includes a template for the next upgrade in:
+
+```text
+utils/email_digest_template.py
+```
+
+`render_hourly_email_digest(jobs)` returns:
+
+- `subject`
+- `text`
+- `html`
+
+It is ready to be used later by an hourly job that:
+
+1. Reads new internships from SQLite.
+2. Reads subscribed user email addresses from a user database table.
+3. Renders the digest template.
+4. Sends the email through a provider such as SendGrid, Mailgun, Amazon SES, or SMTP.
+5. Marks those jobs as emailed so users do not receive duplicates.
+
+No email is sent yet. This file is only the digest template for the later database-email feature.
 
 ## How duplicate detection works
 
@@ -1966,6 +3604,13 @@ That key is stored in SQLite as a unique value. If the same job appears again in
 - Make sure the bot has permission to view and send messages in that channel.
 - Make sure the bot has **Embed Links** permission.
 
+### Scheduled scans are not running
+
+- Check `/status` and confirm auto scan is enabled.
+- Confirm `scan_interval_minutes` is `240`.
+- Keep `python bot.py` running. The schedule stops when the process stops.
+- If you changed `.env` or `config.json`, restart the bot.
+
 ### Slash commands do not appear
 
 - Set `DISCORD_GUILD_ID` in `.env` for faster local testing.
@@ -1983,7 +3628,7 @@ That key is stored in SQLite as a unique value. If the same job appears again in
 ### Duplicate jobs keep posting
 
 - Confirm that `internships.db` is not being deleted between runs.
-- Check if the application links are changing every scan due tracking parameters.
+- Check if the application links are changing every scan due to tracking parameters.
 - Improve `build_dedupe_key()` in `database/db.py` if needed.
 
 ### Python package install errors
@@ -1997,38 +3642,38 @@ python -m pip install -r requirements.txt
 
 If Python is not found, reinstall Python and check **Add python.exe to PATH**.
 
-### Permission errors in Discord
-
-- Check channel permissions, not just server permissions.
-- Private channels need explicit bot access.
-- Make sure role order does not block the bot.
-- Re-invite the bot if you forgot a permission during invite.
-
-## Future upgrade ideas
-
-- Deploy later to Railway, Render, or a VPS.
-- Add email alerts.
-- Add AI summarization of job posts.
-- Add automatic resume keyword matching.
-- Add a stronger applied tracker with notes and deadlines.
-- Add CSV export.
-- Add CSV import for manual LinkedIn/Jobright saved jobs.
-- Add GitHub Actions later if you ever want scheduled cloud scanning.
-- Add per-source category filters.
-- Add a web dashboard login if you deploy it outside localhost.
-
 ## Development notes
 
-This project is intentionally not overengineered. The main flow is:
+The main flow is:
 
-1. `bot.py` receives `/scan`.
+1. `bot.py` starts the Discord bot and scheduled scan loop.
 2. `scanner.py` loads enabled sources from `sources.json`.
 3. `scraper/github_scraper.py` fetches and parses GitHub READMEs.
 4. `utils/filters.py` applies include/exclude keywords.
-5. `database/db.py` stores and deduplicates jobs.
-6. `utils/formatting.py` formats jobs as Discord embeds.
-7. `bot.py` posts new jobs and marks them as posted.
+5. `utils/tags.py` adds FAANG or Non-FAANG classification.
+6. `database/db.py` stores and deduplicates jobs.
+7. `utils/formatting.py` formats jobs as Discord embeds.
+8. `bot.py` posts new jobs and marks them as posted.
+9. `bot.py` also DMs each premium member (see the premium tier section above) their
+   personal top matches for this scan's new jobs, scored by `utils/personalization.py`
+   against their `/set_profile` blurb.
 
-If you want to add a new source later, create a new module in `scraper/`, return the same internship dictionary shape, and call it from `scanner.py`.
+If you add a new source later, create a new module in `scraper/`, return the same internship dictionary shape, and call it from `scanner.py`.
 
+`FULL_PROJECT.md` is a generated snapshot of every tracked file for onboarding/AI-assistant
+context — don't hand-edit it. Regenerate it after changing any tracked file:
+
+```bash
+python scripts/generate_full_project_doc.py
+```
+
+### Running tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Tests focus on `scraper/github_scraper.py` (the markdown-table parser is the most
+format-fragile part of the project) and `utils/tags.py` (FAANG alias matching).
 ```
