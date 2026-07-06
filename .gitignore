@@ -1,5 +1,7 @@
 .env
 internships.db
+config.json
+sources.json
 __pycache__/
 *.pyc
 .venv/
